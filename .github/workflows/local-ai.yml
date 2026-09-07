@@ -1,40 +1,68 @@
-name: Local AI Runner v1.4
+name: Local AI Cluster v2.0
 
 on:
   workflow_dispatch:
     inputs:
-      model:
-        description: "Model yang dipasang langsung di runner"
+      general_model:
+        description: "General / vision / web model"
         required: true
         type: choice
-        default: qwen3:8b
+        default: qwen3.5:9b
         options:
+          - qwen3.5:4b
+          - qwen3.5:9b
           - qwen3:8b
-          - qwen3:14b
-          - qwen2.5:14b
-          - qwen2.5-coder:7b
-          - qwen2.5-coder:14b
-          - custom-ollama
-          - custom-gguf
 
-      custom_model:
-        description: "Isi hanya jika Custom: nama Ollama atau direct HTTPS .gguf URL"
-        required: false
-        type: string
-        default: ""
+      coder_model:
+        description: "Coding model"
+        required: true
+        type: choice
+        default: qwen2.5-coder:7b
+        options:
+          - qwen2.5-coder:7b
+          - qwen3.5:4b
+          - qwen3.5:9b
 
       context:
-        description: "Context length"
+        description: "Ollama context per worker"
         required: true
         type: choice
-        default: "8192"
+        default: "16384"
         options:
-          - "4096"
           - "8192"
           - "16384"
+          - "24576"
+          - "32768"
+
+      thinking:
+        description: "Default reasoning"
+        required: true
+        type: choice
+        default: "off"
+        options:
+          - "off"
+          - "medium"
+
+      web:
+        description: "Native Web Search"
+        required: true
+        type: choice
+        default: "on"
+        options:
+          - "on"
+          - "off"
+
+      tailscale_auth:
+        description: "Private network auth"
+        required: true
+        type: choice
+        default: authkey-easy
+        options:
+          - authkey-easy
+          - oidc-recommended
 
       tunnel:
-        description: "WebUI tunnel (model TIDAK lewat selector/tunnel)"
+        description: "Public tunnel for Open WebUI only"
         required: true
         type: choice
         default: ngrok-stable
@@ -42,34 +70,43 @@ on:
           - ngrok-stable
           - cloudflare-named
 
-permissions: {}
+# No repository contents permission. id-token is only needed for the optional
+# Tailscale OIDC/WIF mode.
+permissions:
+  id-token: write
 
 concurrency:
-  group: local-ai-${{ github.repository }}
+  group: local-ai-cluster-${{ github.repository }}
   cancel-in-progress: true
 
 jobs:
-  local-ai:
+  ai-workers:
+    name: "AI Worker / ${{ matrix.role }}"
     runs-on: ubuntu-24.04
     timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        role: [general, coder]
 
     env:
       BASE: /home/runner/localai
       OLLAMA_MODELS: /home/runner/localai/models
       LOCAL_AI_PASSWORD: ${{ secrets.LOCAL_AI_PASSWORD }}
-      NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
-      CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
-      CF_PUBLIC_URL: ${{ vars.CF_PUBLIC_URL }}
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+      TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+      TS_AUDIENCE: ${{ secrets.TS_AUDIENCE }}
 
     steps:
-      - name: Authorize owner and prepare runner
+      - name: Owner guard + validate secrets
         shell: bash
         run: |
           set -euo pipefail
           umask 077
 
           if [ "$GITHUB_ACTOR" != "$GITHUB_REPOSITORY_OWNER" ]; then
-            echo "::error::Hanya repository owner yang boleh menjalankan workflow ini."
+            echo "::error::Hanya repository owner yang boleh menjalankan cluster."
             exit 1
           fi
 
@@ -77,446 +114,1207 @@ jobs:
             echo "::error::Secret LOCAL_AI_PASSWORD belum dibuat."
             exit 1
           fi
-
           echo "::add-mask::$LOCAL_AI_PASSWORD"
-          [ -n "${NGROK_AUTHTOKEN:-}" ] && echo "::add-mask::$NGROK_AUTHTOKEN"
-          [ -n "${CF_TUNNEL_TOKEN:-}" ] && echo "::add-mask::$CF_TUNNEL_TOKEN"
 
-          mkdir -p \
-            "$BASE/models" \
-            "$BASE/openwebui-data" \
-            "$BASE/custom" \
-            "$BASE/workspace" \
-            "$BASE/logs" \
-            "$BASE/bin"
+          if [ "${{ inputs.tailscale_auth }}" = "authkey-easy" ]; then
+            if [ -z "${TAILSCALE_AUTHKEY:-}" ]; then
+              echo "::error::Secret TAILSCALE_AUTHKEY belum dibuat."
+              exit 1
+            fi
+            echo "::add-mask::$TAILSCALE_AUTHKEY"
+          else
+            if [ -z "${TS_OAUTH_CLIENT_ID:-}" ] || [ -z "${TS_AUDIENCE:-}" ]; then
+              echo "::error::OIDC membutuhkan TS_OAUTH_CLIENT_ID dan TS_AUDIENCE."
+              exit 1
+            fi
+            echo "::add-mask::$TS_OAUTH_CLIENT_ID"
+            echo "::add-mask::$TS_AUDIENCE"
+          fi
+
+          mkdir -p "$BASE/models" "$BASE/bin" "$BASE/logs"
           chmod -R go-rwx "$BASE"
 
-          echo "===== RUNNER ====="
-          echo "Model input : ${{ inputs.model }}"
-          echo "Context     : ${{ inputs.context }}"
-          echo "Tunnel      : ${{ inputs.tunnel }}"
-          echo
-          nproc
+          ROLE="${{ matrix.role }}"
+          if [ "$ROLE" = "general" ]; then
+            MODEL="${{ inputs.general_model }}"
+            GATEWAY_PORT=9001
+          else
+            MODEL="${{ inputs.coder_model }}"
+            GATEWAY_PORT=9002
+          fi
+
+          HOSTNAME="ai-${ROLE}-${GITHUB_RUN_ID}"
+          CLUSTER_KEY="$(printf '%s' "${LOCAL_AI_PASSWORD}:${GITHUB_RUN_ID}:local-ai-cluster-v2" | sha256sum | awk '{print $1}')"
+
+          echo "::add-mask::$CLUSTER_KEY"
+          {
+            echo "ROLE=$ROLE"
+            echo "MODEL=$MODEL"
+            echo "GATEWAY_PORT=$GATEWAY_PORT"
+            echo "TS_HOSTNAME=$HOSTNAME"
+            echo "CLUSTER_KEY=$CLUSTER_KEY"
+          } >> "$GITHUB_ENV"
+
+          echo "Role=$ROLE"
+          echo "Model=$MODEL"
+          echo "Hostname=$HOSTNAME"
+          echo "No actions/checkout; repository source is not mounted."
+
+      - name: Tailscale / auth key
+        if: ${{ inputs.tailscale_auth == 'authkey-easy' }}
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          hostname: ${{ env.TS_HOSTNAME }}
+          use-cache: "false"
+          log-mode: grouped
+
+      - name: Tailscale / OIDC WIF
+        if: ${{ inputs.tailscale_auth == 'oidc-recommended' }}
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:ci
+          hostname: ${{ env.TS_HOSTNAME }}
+          use-cache: "false"
+          log-mode: grouped
+
+      - name: Record private Tailscale address
+        shell: bash
+        run: |
+          set -euo pipefail
+          TS_IP="$(tailscale ip -4 | head -1)"
+          if [ -z "$TS_IP" ]; then
+            echo "::error::Tailscale IPv4 tidak ditemukan."
+            exit 1
+          fi
+          echo "TS_IP=$TS_IP" >> "$GITHUB_ENV"
+          echo "Tailscale node ready: $TS_HOSTNAME"
+
+      - name: Adaptive Linux memory tuning
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "===== BEFORE ====="
           free -h
           df -h /
 
-      - name: Resolve and validate model
-        id: selected
-        shell: bash
-        env:
-          INPUT_MODEL: ${{ inputs.model }}
-          CUSTOM_MODEL: ${{ inputs.custom_model }}
-        run: |
-          set -euo pipefail
-          umask 077
+          # Extra swap is only created when the runner really has spare disk.
+          # GitHub does not guarantee the large free disk seen on every run.
+          FREE_KB="$(df --output=avail -k / | tail -1 | tr -d ' ')"
+          if [ "$FREE_KB" -gt $((35 * 1024 * 1024)) ]; then
+            SWAPFILE="/swapfile-localai"
+            if ! swapon --show=NAME | grep -qx "$SWAPFILE"; then
+              sudo fallocate -l 8G "$SWAPFILE"
+              sudo chmod 600 "$SWAPFILE"
+              sudo mkswap "$SWAPFILE" >/dev/null
+              sudo swapon "$SWAPFILE"
+            fi
+          else
+            echo "Extra swap skipped: preserving disk space."
+          fi
 
-          python3 - <<'PY'
-          import os, re, sys, socket, ipaddress
-          from urllib.parse import urlparse
+          sudo sysctl -w vm.swappiness=10 >/dev/null
+          sudo sysctl -w vm.page-cluster=0 >/dev/null
 
-          preset = os.environ["INPUT_MODEL"].strip()
-          custom = os.environ.get("CUSTOM_MODEL", "").strip()
+          echo "MALLOC_ARENA_MAX=2" >> "$GITHUB_ENV"
 
-          allowed = {
-              "qwen3:8b",
-              "qwen3:14b",
-              "qwen2.5:14b",
-              "qwen2.5-coder:7b",
-              "qwen2.5-coder:14b",
-          }
-
-          model_re = re.compile(
-              r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,180}(?::[A-Za-z0-9._-]{1,80})?$"
-          )
-
-          def public_https(url):
-              try:
-                  u = urlparse(url)
-                  if u.scheme != "https" or not u.hostname or u.username or u.password:
-                      return False
-                  host = u.hostname.lower().rstrip(".")
-                  if host == "localhost" or host.endswith(".local"):
-                      return False
-                  infos = socket.getaddrinfo(host, u.port or 443, type=socket.SOCK_STREAM)
-                  if not infos:
-                      return False
-                  for info in infos:
-                      ip = ipaddress.ip_address(info[4][0])
-                      if (ip.is_private or ip.is_loopback or ip.is_link_local or
-                          ip.is_multicast or ip.is_reserved or ip.is_unspecified):
-                          return False
-                  return True
-              except Exception:
-                  return False
-
-          if preset in allowed:
-              kind, value = "ollama", preset
-          elif preset == "custom-ollama":
-              if not custom or not model_re.fullmatch(custom):
-                  print("Invalid custom Ollama model", file=sys.stderr)
-                  sys.exit(1)
-              kind, value = "ollama", custom
-          elif preset == "custom-gguf":
-              if not custom or len(custom) > 2048 or not public_https(custom):
-                  print("Custom GGUF harus berupa direct HTTPS URL publik.", file=sys.stderr)
-                  sys.exit(1)
-              kind, value = "gguf", custom
-          else:
-              print("Unknown model preset", file=sys.stderr)
-              sys.exit(1)
-
-          out = os.environ["GITHUB_OUTPUT"]
-          with open(out, "a", encoding="utf-8") as f:
-              f.write(f"kind={kind}\n")
-              if kind == "ollama":
-                  f.write(f"value={value}\n")
-                  print("Resolved model:", value)
-              else:
-                  # URL GGUF tidak ditampilkan ke log.
-                  f.write("value<<EOF\n")
-                  f.write(value + "\n")
-                  f.write("EOF\n")
-                  print("Resolved model: custom GGUF")
-          PY
+          echo "===== AFTER ====="
+          free -h
+          swapon --show || true
 
       - name: Install Ollama
         shell: bash
         run: |
           set -euo pipefail
+
           curl --proto '=https' --tlsv1.2 -fsSL https://ollama.com/install.sh | sh
+
           sudo systemctl stop ollama 2>/dev/null || true
-          pkill -f "ollama serve" 2>/dev/null || true
-          sleep 2
+          pkill -f 'ollama serve' 2>/dev/null || true
+          sleep 1
+
           ollama --version
 
-      - name: Start Ollama on runner only
-        id: ollama
+      - name: Start private Ollama
         shell: bash
-        env:
-          SELECTED_CONTEXT: ${{ inputs.context }}
         run: |
           set -euo pipefail
-          export OLLAMA_HOST=127.0.0.1:11434
-          export OLLAMA_MODELS="$OLLAMA_MODELS"
-          export OLLAMA_CONTEXT_LENGTH="$SELECTED_CONTEXT"
-          export OLLAMA_NUM_PARALLEL=1
-          export OLLAMA_MAX_LOADED_MODELS=1
-          export OLLAMA_KEEP_ALIVE=15m
-          exec ollama serve
-        background: true
 
-      - name: Wait for local Ollama
-        shell: bash
-        run: |
-          set -euo pipefail
-          for i in {1..75}; do
+          # Ollama never binds to the public interface or the Tailscale interface.
+          # Only the narrow authenticated gateway below can reach it.
+          nohup env \
+            OLLAMA_HOST=127.0.0.1:11434 \
+            OLLAMA_MODELS="$OLLAMA_MODELS" \
+            OLLAMA_CONTEXT_LENGTH="${{ inputs.context }}" \
+            OLLAMA_MAX_LOADED_MODELS=1 \
+            OLLAMA_NUM_PARALLEL=1 \
+            OLLAMA_MAX_QUEUE=8 \
+            OLLAMA_KEEP_ALIVE=-1 \
+            OLLAMA_FLASH_ATTENTION=1 \
+            OLLAMA_KV_CACHE_TYPE=q8_0 \
+            MALLOC_ARENA_MAX=2 \
+            ollama serve \
+            >"$BASE/logs/ollama.log" 2>&1 &
+
+          echo $! > "$BASE/ollama.pid"
+
+          for i in {1..120}; do
             if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
-              echo "Ollama local API: OK"
+              echo "Ollama API ready."
               exit 0
             fi
             sleep 1
           done
-          echo "::error::Ollama tidak merespons."
+
+          tail -200 "$BASE/logs/ollama.log" || true
+          echo "::error::Ollama gagal start."
           exit 1
 
-      - name: Install selected model directly on runner
-        id: model
+      - name: Pull role-specific model
         shell: bash
-        env:
-          MODEL_KIND: ${{ steps.selected.outputs.kind }}
-          MODEL_VALUE: ${{ steps.selected.outputs.value }}
-          SELECTED_CONTEXT: ${{ inputs.context }}
+        run: |
+          set -euo pipefail
+          START="$(date +%s)"
+
+          ollama pull "$MODEL"
+
+          END="$(date +%s)"
+          echo "Model download completed in $((END - START))s."
+          ollama list
+          free -h
+
+      - name: Warm model
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PAYLOAD="$(jq -cn \
+            --arg model "$MODEL" \
+            '{
+              model:$model,
+              messages:[{role:"user",content:"Balas hanya OK"}],
+              stream:false,
+              think:false,
+              keep_alive:-1,
+              options:{num_predict:16,temperature:0}
+            }'
+          )"
+
+          START="$(date +%s)"
+          RESPONSE="$(curl -fsS --max-time 300 \
+            -H 'Content-Type: application/json' \
+            -d "$PAYLOAD" \
+            http://127.0.0.1:11434/api/chat)"
+          END="$(date +%s)"
+
+          ANSWER="$(echo "$RESPONSE" | jq -r '.message.content // empty' | head -c 120)"
+          echo "Warm response: $ANSWER"
+          echo "Warm total: $((END - START))s"
+          ollama ps || true
+
+          {
+            echo "## Worker: $ROLE"
+            echo
+            echo "- Model: \`$MODEL\`"
+            echo "- Context: **${{ inputs.context }}**"
+            echo "- Warm request: **$((END - START))s**"
+            echo "- Ollama: localhost only"
+            echo "- Gateway: authenticated + Tailscale-only"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create narrow authenticated worker gateway
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > "$BASE/worker_gateway.py" <<'PY'
+          import json
+          import os
+          import hmac
+          import http.client
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+          ROLE = os.environ["ROLE"]
+          MODEL = os.environ["MODEL"]
+          KEY = os.environ["CLUSTER_KEY"]
+          BIND = os.environ["TS_IP"]
+          PORT = int(os.environ["GATEWAY_PORT"])
+
+          def send_json(handler, status, obj):
+              data = json.dumps(obj, separators=(",", ":")).encode()
+              handler.send_response(status)
+              handler.send_header("Content-Type", "application/json")
+              handler.send_header("Content-Length", str(len(data)))
+              handler.send_header("Connection", "close")
+              handler.end_headers()
+              handler.wfile.write(data)
+              handler.close_connection = True
+
+          class Handler(BaseHTTPRequestHandler):
+              protocol_version = "HTTP/1.1"
+
+              def log_message(self, fmt, *args):
+                  print(f"[{ROLE}] {self.address_string()} - {fmt % args}", flush=True)
+
+              def authorized(self):
+                  expected = f"Bearer {KEY}"
+                  supplied = self.headers.get("Authorization", "")
+                  return hmac.compare_digest(supplied, expected)
+
+              def do_GET(self):
+                  if not self.authorized():
+                      send_json(self, 401, {"error": "unauthorized"})
+                      return
+
+                  if self.path == "/health":
+                      send_json(self, 200, {
+                          "status": "ok",
+                          "role": ROLE,
+                          "model": MODEL
+                      })
+                      return
+
+                  send_json(self, 404, {"error": "not_found"})
+
+              def do_POST(self):
+                  if not self.authorized():
+                      send_json(self, 401, {"error": "unauthorized"})
+                      return
+
+                  if self.path != "/v1/chat/completions":
+                      send_json(self, 404, {"error": "not_found"})
+                      return
+
+                  try:
+                      length = int(self.headers.get("Content-Length", "0"))
+                      raw = self.rfile.read(length)
+                      body = json.loads(raw.decode("utf-8"))
+                      body["model"] = MODEL
+                      raw = json.dumps(body, separators=(",", ":")).encode("utf-8")
+
+                      conn = http.client.HTTPConnection("127.0.0.1", 11434, timeout=1800)
+                      conn.request(
+                          "POST",
+                          "/v1/chat/completions",
+                          body=raw,
+                          headers={
+                              "Content-Type": "application/json",
+                              "Authorization": "Bearer ollama",
+                              "Connection": "close",
+                          },
+                      )
+                      resp = conn.getresponse()
+
+                      self.send_response(resp.status)
+                      ctype = resp.getheader("Content-Type")
+                      if ctype:
+                          self.send_header("Content-Type", ctype)
+                      cache = resp.getheader("Cache-Control")
+                      if cache:
+                          self.send_header("Cache-Control", cache)
+                      self.send_header("Connection", "close")
+                      self.end_headers()
+
+                      while True:
+                          chunk = resp.read1(16384)
+                          if not chunk:
+                              break
+                          self.wfile.write(chunk)
+                          self.wfile.flush()
+
+                      conn.close()
+                      self.close_connection = True
+
+                  except Exception as exc:
+                      print(f"[{ROLE}] proxy error: {exc!r}", flush=True)
+                      try:
+                          send_json(self, 502, {"error": "worker_proxy_error"})
+                      except Exception:
+                          pass
+
+          print(f"Worker gateway role={ROLE} bind={BIND}:{PORT} model={MODEL}", flush=True)
+          ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()
+          PY
+
+          python3 -m py_compile "$BASE/worker_gateway.py"
+
+          nohup env \
+            ROLE="$ROLE" \
+            MODEL="$MODEL" \
+            CLUSTER_KEY="$CLUSTER_KEY" \
+            TS_IP="$TS_IP" \
+            GATEWAY_PORT="$GATEWAY_PORT" \
+            python3 "$BASE/worker_gateway.py" \
+            >"$BASE/logs/gateway.log" 2>&1 &
+
+          echo $! > "$BASE/gateway.pid"
+
+          for i in {1..60}; do
+            if curl -fsS \
+              -H "Authorization: Bearer $CLUSTER_KEY" \
+              "http://${TS_IP}:${GATEWAY_PORT}/health" >/dev/null 2>&1; then
+              echo "Worker gateway ready."
+              exit 0
+            fi
+            sleep 1
+          done
+
+          tail -100 "$BASE/logs/gateway.log" || true
+          echo "::error::Worker gateway gagal start."
+          exit 1
+
+      - name: Keep worker alive while frontend exists
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FRONT_HOST="ai-front-${GITHUB_RUN_ID}"
+          FRONT_SEEN=0
+          MISSES=0
+          START="$(date +%s)"
+
+          echo "Worker ready. Waiting for frontend peer: $FRONT_HOST"
+
+          while true; do
+            kill -0 "$(cat "$BASE/ollama.pid")" 2>/dev/null || {
+              echo "::error::Ollama process stopped."
+              tail -200 "$BASE/logs/ollama.log" || true
+              exit 1
+            }
+
+            kill -0 "$(cat "$BASE/gateway.pid")" 2>/dev/null || {
+              echo "::error::Gateway process stopped."
+              tail -200 "$BASE/logs/gateway.log" || true
+              exit 1
+            }
+
+            FOUND="$(tailscale status --json 2>/dev/null | \
+              jq -r --arg h "$FRONT_HOST" \
+              '[.Peer[]? | select(.HostName == $h)] | length' 2>/dev/null || echo 0)"
+
+            if [ "$FOUND" -gt 0 ]; then
+              FRONT_SEEN=1
+              MISSES=0
+            elif [ "$FRONT_SEEN" -eq 1 ]; then
+              MISSES=$((MISSES + 1))
+            fi
+
+            # If the frontend existed and then disappeared for 5 minutes,
+            # stop wasting a hosted runner.
+            if [ "$MISSES" -ge 5 ]; then
+              echo "Frontend peer disappeared; worker exits."
+              exit 0
+            fi
+
+            # Also exit if the frontend never appears within 20 minutes.
+            NOW="$(date +%s)"
+            if [ "$FRONT_SEEN" -eq 0 ] && [ $((NOW - START)) -gt 1200 ]; then
+              echo "::error::Frontend peer never appeared."
+              exit 1
+            fi
+
+            sleep 60
+          done
+
+  frontend:
+    name: "Frontend / Router / WebUI"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    env:
+      BASE: /home/runner/localai
+      LOCAL_AI_PASSWORD: ${{ secrets.LOCAL_AI_PASSWORD }}
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+      TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+      TS_AUDIENCE: ${{ secrets.TS_AUDIENCE }}
+      NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+      CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+      CF_PUBLIC_URL: ${{ vars.CF_PUBLIC_URL }}
+
+    steps:
+      - name: Owner guard + validate secrets
+        shell: bash
         run: |
           set -euo pipefail
           umask 077
 
-          if [ "$MODEL_KIND" = "ollama" ]; then
-            ollama pull "$MODEL_VALUE"
-            FINAL_MODEL="$MODEL_VALUE"
-          else
-            GGUF="$BASE/custom/model.gguf"
-            curl --proto '=https' --tlsv1.2 \
-              -fL --retry 3 --retry-delay 3 \
-              "$MODEL_VALUE" -o "$GGUF"
-
-            cat > "$BASE/custom/Modelfile" <<EOF
-          FROM $GGUF
-          PARAMETER num_ctx $SELECTED_CONTEXT
-          EOF
-
-            ollama create custom-gguf -f "$BASE/custom/Modelfile"
-            FINAL_MODEL="custom-gguf"
+          if [ "$GITHUB_ACTOR" != "$GITHUB_REPOSITORY_OWNER" ]; then
+            echo "::error::Hanya repository owner yang boleh menjalankan cluster."
+            exit 1
           fi
 
-          echo "name=$FINAL_MODEL" >> "$GITHUB_OUTPUT"
-          echo
-          ollama list
-          echo
-          free -h
+          if [ -z "${LOCAL_AI_PASSWORD:-}" ]; then
+            echo "::error::Secret LOCAL_AI_PASSWORD belum dibuat."
+            exit 1
+          fi
+          echo "::add-mask::$LOCAL_AI_PASSWORD"
 
-      - name: Preflight inference without Qwen3 thinking
-        shell: bash
-        env:
-          FINAL_MODEL: ${{ steps.model.outputs.name }}
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          import json, os, time, urllib.request, sys
-
-          model = os.environ["FINAL_MODEL"]
-          payload = {
-              "model": model,
-              "prompt": "Reply with exactly: OK",
-              "stream": False,
-              "think": False,
-              "keep_alive": "15m",
-              "options": {
-                  "num_predict": 32,
-                  "temperature": 0
-              }
-          }
-
-          req = urllib.request.Request(
-              "http://127.0.0.1:11434/api/generate",
-              data=json.dumps(payload).encode(),
-              headers={"Content-Type":"application/json"},
-              method="POST"
-          )
-
-          t0 = time.monotonic()
-          try:
-              with urllib.request.urlopen(req, timeout=300) as r:
-                  data = json.loads(r.read().decode())
-          except Exception as e:
-              print("PRE-FLIGHT ERROR:", repr(e))
-              sys.exit(1)
-
-          wall = time.monotonic() - t0
-          response = (data.get("response") or "").strip()
-          thinking = (data.get("thinking") or "").strip()
-
-          if not response:
-              print("PRE-FLIGHT FAILED: final response kosong")
-              if thinking:
-                  print("Model menghasilkan thinking tetapi tidak final response.")
-              print(json.dumps({
-                  "done": data.get("done"),
-                  "done_reason": data.get("done_reason"),
-                  "eval_count": data.get("eval_count"),
-                  "prompt_eval_count": data.get("prompt_eval_count"),
-              }, indent=2))
-              sys.exit(1)
-
-          eval_count = int(data.get("eval_count") or 0)
-          eval_ns = int(data.get("eval_duration") or 0)
-          speed = eval_count / (eval_ns / 1e9) if eval_count and eval_ns else 0
-
-          print("===== PRE-FLIGHT PASS =====")
-          print("Response:", response[:200])
-          print(f"Wall time: {wall:.2f}s")
-          print(f"Speed: {speed:.2f} tok/s")
-
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
-              f.write("## 🧪 Model test\n\n")
-              f.write(f"- Model: `{model}`\n")
-              f.write(f"- Response: `{response[:80]}`\n")
-              f.write(f"- Wall time: **{wall:.2f}s**\n")
-              f.write(f"- Speed: **{speed:.2f} tok/s**\n")
-          PY
-
-          echo
-          ollama ps || true
-          free -h
-
-      - name: Pull Open WebUI
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker pull ghcr.io/open-webui/open-webui:main
-
-      - name: Start Open WebUI locally
-        shell: bash
-        env:
-          FINAL_MODEL: ${{ steps.model.outputs.name }}
-        run: |
-          set -euo pipefail
-          WEBUI_SECRET_KEY="$(openssl rand -hex 32)"
-
-          docker rm -f open-webui 2>/dev/null || true
-
-          docker run -d \
-            --name open-webui \
-            --network host \
-            -e OLLAMA_BASE_URL=http://127.0.0.1:11434 \
-            -e WEBUI_SECRET_KEY="$WEBUI_SECRET_KEY" \
-            -e WEBUI_AUTH=True \
-            -e WEBUI_ADMIN_EMAIL=admin@local.ai \
-            -e WEBUI_ADMIN_PASSWORD="$LOCAL_AI_PASSWORD" \
-            -e WEBUI_ADMIN_NAME="Local AI Admin" \
-            -e ENABLE_SIGNUP=False \
-            -e ENABLE_WEB_SEARCH=False \
-            -e ENABLE_PLUGINS=False \
-            -v "$BASE/openwebui-data:/app/backend/data" \
-            ghcr.io/open-webui/open-webui:main
-
-          for i in {1..180}; do
-            if curl -fsS http://127.0.0.1:8080/ >/dev/null 2>&1; then
-              echo "Open WebUI localhost:8080 READY"
-              exit 0
+          if [ "${{ inputs.tailscale_auth }}" = "authkey-easy" ]; then
+            if [ -z "${TAILSCALE_AUTHKEY:-}" ]; then
+              echo "::error::Secret TAILSCALE_AUTHKEY belum dibuat."
+              exit 1
             fi
-            sleep 2
-          done
-
-          docker logs --tail 250 open-webui || true
-          exit 1
-
-      - name: Install tunnel client
-        shell: bash
-        run: |
-          set -euo pipefail
+            echo "::add-mask::$TAILSCALE_AUTHKEY"
+          else
+            if [ -z "${TS_OAUTH_CLIENT_ID:-}" ] || [ -z "${TS_AUDIENCE:-}" ]; then
+              echo "::error::OIDC membutuhkan TS_OAUTH_CLIENT_ID dan TS_AUDIENCE."
+              exit 1
+            fi
+            echo "::add-mask::$TS_OAUTH_CLIENT_ID"
+            echo "::add-mask::$TS_AUDIENCE"
+          fi
 
           if [ "${{ inputs.tunnel }}" = "ngrok-stable" ]; then
             if [ -z "${NGROK_AUTHTOKEN:-}" ]; then
               echo "::error::Secret NGROK_AUTHTOKEN belum dibuat."
               exit 1
             fi
-            python3 -m pip install --user --disable-pip-version-check "ngrok==1.7.0"
+            echo "::add-mask::$NGROK_AUTHTOKEN"
           else
-            if [ -z "${CF_TUNNEL_TOKEN:-}" ]; then
-              echo "::error::Secret CF_TUNNEL_TOKEN belum dibuat."
+            if [ -z "${CF_TUNNEL_TOKEN:-}" ] || [ -z "${CF_PUBLIC_URL:-}" ]; then
+              echo "::error::Cloudflare membutuhkan CF_TUNNEL_TOKEN dan CF_PUBLIC_URL."
               exit 1
             fi
-            if [ -z "${CF_PUBLIC_URL:-}" ]; then
-              echo "::error::Repository Variable CF_PUBLIC_URL belum dibuat (contoh https://ai.domainmu.com)."
-              exit 1
-            fi
-
-            curl --proto '=https' --tlsv1.2 -fL --retry 3 \
-              https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-              -o "$BASE/bin/cloudflared"
-            chmod 700 "$BASE/bin/cloudflared"
-            "$BASE/bin/cloudflared" --version
+            echo "::add-mask::$CF_TUNNEL_TOKEN"
           fi
 
-      - name: Start ngrok for WebUI only
-        id: ngrok
-        if: ${{ inputs.tunnel == 'ngrok-stable' }}
+          mkdir -p "$BASE/bin" "$BASE/logs" "$BASE/openwebui-data"
+          chmod -R go-rwx "$BASE"
+
+          TS_HOSTNAME="ai-front-${GITHUB_RUN_ID}"
+          CLUSTER_KEY="$(printf '%s' "${LOCAL_AI_PASSWORD}:${GITHUB_RUN_ID}:local-ai-cluster-v2" | sha256sum | awk '{print $1}')"
+
+          echo "::add-mask::$CLUSTER_KEY"
+          {
+            echo "TS_HOSTNAME=$TS_HOSTNAME"
+            echo "CLUSTER_KEY=$CLUSTER_KEY"
+            echo "GENERAL_HOST=ai-general-${GITHUB_RUN_ID}"
+            echo "CODER_HOST=ai-coder-${GITHUB_RUN_ID}"
+          } >> "$GITHUB_ENV"
+
+          echo "Frontend hostname=$TS_HOSTNAME"
+          echo "No actions/checkout; repository source is not mounted."
+
+      - name: Tailscale / auth key
+        if: ${{ inputs.tailscale_auth == 'authkey-easy' }}
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          hostname: ${{ env.TS_HOSTNAME }}
+          use-cache: "false"
+          log-mode: grouped
+
+      - name: Tailscale / OIDC WIF
+        if: ${{ inputs.tailscale_auth == 'oidc-recommended' }}
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:ci
+          hostname: ${{ env.TS_HOSTNAME }}
+          use-cache: "false"
+          log-mode: grouped
+
+      - name: Wait for both private workers
         shell: bash
-        env:
-          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
         run: |
           set -euo pipefail
-          exec python3 - <<'PY'
-          import ngrok, time, os
-          url_file = os.path.join(os.environ["BASE"], "public-url.txt")
-          listener = ngrok.forward(8080, authtoken_from_env=True)
-          with open(url_file, "w", encoding="utf-8") as f:
-              f.write(listener.url())
-          print("ngrok WebUI tunnel ready", flush=True)
-          while True:
-              time.sleep(3600)
+
+          echo "Waiting for:"
+          echo "  $GENERAL_HOST"
+          echo "  $CODER_HOST"
+
+          GENERAL_IP=""
+          CODER_IP=""
+
+          for i in {1..240}; do
+            STATUS="$(tailscale status --json 2>/dev/null || echo '{}')"
+
+            GENERAL_IP="$(echo "$STATUS" | jq -r --arg h "$GENERAL_HOST" \
+              '.Peer[]? | select(.HostName == $h) | .TailscaleIPs[0]' | head -1)"
+            CODER_IP="$(echo "$STATUS" | jq -r --arg h "$CODER_HOST" \
+              '.Peer[]? | select(.HostName == $h) | .TailscaleIPs[0]' | head -1)"
+
+            G_OK=0
+            C_OK=0
+
+            if [ -n "$GENERAL_IP" ]; then
+              curl -fsS --max-time 3 \
+                -H "Authorization: Bearer $CLUSTER_KEY" \
+                "http://${GENERAL_IP}:9001/health" >/dev/null 2>&1 && G_OK=1
+            fi
+
+            if [ -n "$CODER_IP" ]; then
+              curl -fsS --max-time 3 \
+                -H "Authorization: Bearer $CLUSTER_KEY" \
+                "http://${CODER_IP}:9002/health" >/dev/null 2>&1 && C_OK=1
+            fi
+
+            if [ "$G_OK" -eq 1 ] && [ "$C_OK" -eq 1 ]; then
+              {
+                echo "GENERAL_IP=$GENERAL_IP"
+                echo "CODER_IP=$CODER_IP"
+              } >> "$GITHUB_ENV"
+
+              echo "Both workers are ready."
+              exit 0
+            fi
+
+            if (( i % 12 == 0 )); then
+              echo "Still waiting... general=$G_OK coder=$C_OK"
+            fi
+
+            sleep 5
+          done
+
+          echo "::error::Workers did not become ready within 20 minutes."
+          tailscale status || true
+          exit 1
+
+      - name: Measure private network path
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          G_PING="$(tailscale ping -c 1 "$GENERAL_IP" 2>&1 || true)"
+          C_PING="$(tailscale ping -c 1 "$CODER_IP" 2>&1 || true)"
+
+          echo "GENERAL: $G_PING"
+          echo "CODER:   $C_PING"
+
+          {
+            echo "## 🌐 Cluster network"
+            echo
+            echo "- General worker: \`$GENERAL_HOST\`"
+            echo "- Coder worker: \`$CODER_HOST\`"
+            echo "- General path: \`$(echo "$G_PING" | tail -1 | tr '\`' ' ' | head -c 180)\`"
+            echo "- Coder path: \`$(echo "$C_PING" | tail -1 | tr '\`' ' ' | head -c 180)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create Local AI Auto router
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > "$BASE/router.py" <<'PY'
+          import json
+          import os
+          import re
+          import hmac
+          import time
+          import http.client
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+          KEY = os.environ["CLUSTER_KEY"]
+          GENERAL_IP = os.environ["GENERAL_IP"]
+          CODER_IP = os.environ["CODER_IP"]
+          THINKING = os.environ.get("THINKING_DEFAULT", "off")
+
+          UPSTREAMS = {
+              "general": (GENERAL_IP, 9001),
+              "coder": (CODER_IP, 9002),
+          }
+
+          CODE_PATTERNS = [
+              r"\b(code|coding|program|programming|debug|bug|stacktrace|traceback)\b",
+              r"\b(python|javascript|typescript|java|kotlin|swift|rust|golang|c\+\+|c#)\b",
+              r"\b(android|gradle|apk|apktool|jadx|adb|logcat|ndk|\.so)\b",
+              r"\b(git|github action|workflow|yaml|docker|shell|bash|terminal|compile|build)\b",
+              r"\b(function|class|method|regex|sql|api endpoint|exception|segfault)\b",
+              r"\.(py|js|ts|tsx|jsx|java|kt|kts|cpp|cc|c|h|hpp|rs|go|sh|ps1|yml|yaml|json)\b",
+              r"```",
+          ]
+          CODE_RE = re.compile("|".join(f"(?:{p})" for p in CODE_PATTERNS), re.I)
+
+          def send_json(handler, status, obj):
+              data = json.dumps(obj, separators=(",", ":")).encode()
+              handler.send_response(status)
+              handler.send_header("Content-Type", "application/json")
+              handler.send_header("Content-Length", str(len(data)))
+              handler.send_header("Connection", "close")
+              handler.end_headers()
+              handler.wfile.write(data)
+              handler.close_connection = True
+
+          def extract_latest_user(messages):
+              for msg in reversed(messages or []):
+                  if msg.get("role") != "user":
+                      continue
+                  content = msg.get("content", "")
+                  if isinstance(content, str):
+                      return content, False
+                  if isinstance(content, list):
+                      texts = []
+                      has_image = False
+                      for part in content:
+                          if not isinstance(part, dict):
+                              continue
+                          if part.get("type") in ("image_url", "input_image", "image"):
+                              has_image = True
+                          text = part.get("text")
+                          if isinstance(text, str):
+                              texts.append(text)
+                      return "\n".join(texts), has_image
+              return "", False
+
+          def choose_route(body):
+              text, has_image = extract_latest_user(body.get("messages", []))
+              if has_image:
+                  return "general"
+              if CODE_RE.search(text):
+                  return "coder"
+              return "general"
+
+          def forward(handler, body, route):
+              order = [route, "coder" if route == "general" else "general"]
+              raw = json.dumps(body, separators=(",", ":")).encode("utf-8")
+              last_error = None
+
+              for attempt, target in enumerate(order, start=1):
+                  host, port = UPSTREAMS[target]
+                  try:
+                      started = time.monotonic()
+                      conn = http.client.HTTPConnection(host, port, timeout=1800)
+                      conn.request(
+                          "POST",
+                          "/v1/chat/completions",
+                          body=raw,
+                          headers={
+                              "Content-Type": "application/json",
+                              "Authorization": f"Bearer {KEY}",
+                              "Connection": "close",
+                          },
+                      )
+                      resp = conn.getresponse()
+
+                      if resp.status >= 500 and attempt == 1:
+                          last_error = RuntimeError(f"{target} returned {resp.status}")
+                          resp.read()
+                          conn.close()
+                          continue
+
+                      handler.send_response(resp.status)
+                      ctype = resp.getheader("Content-Type")
+                      if ctype:
+                          handler.send_header("Content-Type", ctype)
+                      cache = resp.getheader("Cache-Control")
+                      if cache:
+                          handler.send_header("Cache-Control", cache)
+                      handler.send_header("X-Local-AI-Route", target)
+                      handler.send_header("Connection", "close")
+                      handler.end_headers()
+
+                      while True:
+                          chunk = resp.read1(16384)
+                          if not chunk:
+                              break
+                          handler.wfile.write(chunk)
+                          handler.wfile.flush()
+
+                      elapsed = time.monotonic() - started
+                      print(
+                          f"route={target} requested={route} elapsed={elapsed:.2f}s "
+                          f"fallback={'yes' if target != route else 'no'}",
+                          flush=True,
+                      )
+                      conn.close()
+                      handler.close_connection = True
+                      return
+
+                  except Exception as exc:
+                      last_error = exc
+                      print(f"route={target} failure={exc!r}", flush=True)
+
+              raise last_error or RuntimeError("no upstream available")
+
+          class Handler(BaseHTTPRequestHandler):
+              protocol_version = "HTTP/1.1"
+
+              def log_message(self, fmt, *args):
+                  print(f"[router] {self.address_string()} - {fmt % args}", flush=True)
+
+              def authorized(self):
+                  expected = f"Bearer {KEY}"
+                  supplied = self.headers.get("Authorization", "")
+                  return hmac.compare_digest(supplied, expected)
+
+              def do_GET(self):
+                  if not self.authorized() and self.path != "/health":
+                      send_json(self, 401, {"error": "unauthorized"})
+                      return
+
+                  if self.path == "/health":
+                      send_json(self, 200, {
+                          "status": "ok",
+                          "model": "local-auto",
+                          "workers": ["general", "coder"],
+                      })
+                      return
+
+                  if self.path == "/v1/models":
+                      send_json(self, 200, {
+                          "object": "list",
+                          "data": [{
+                              "id": "local-auto",
+                              "object": "model",
+                              "created": 0,
+                              "owned_by": "local-ai-cluster",
+                          }]
+                      })
+                      return
+
+                  if self.path == "/v1/models/local-auto":
+                      send_json(self, 200, {
+                          "id": "local-auto",
+                          "object": "model",
+                          "created": 0,
+                          "owned_by": "local-ai-cluster",
+                      })
+                      return
+
+                  send_json(self, 404, {"error": "not_found"})
+
+              def do_POST(self):
+                  if not self.authorized():
+                      send_json(self, 401, {"error": "unauthorized"})
+                      return
+
+                  if self.path != "/v1/chat/completions":
+                      send_json(self, 404, {"error": "not_found"})
+                      return
+
+                  try:
+                      length = int(self.headers.get("Content-Length", "0"))
+                      raw = self.rfile.read(length)
+                      body = json.loads(raw.decode("utf-8"))
+
+                      route = choose_route(body)
+
+                      # The public-facing model is virtual. Each worker gateway
+                      # forces its own real model, so the virtual ID never leaks
+                      # into Ollama.
+                      body["model"] = "local-auto"
+
+                      if THINKING == "off":
+                          body.setdefault("reasoning_effort", "none")
+                      elif THINKING == "medium":
+                          body.setdefault("reasoning_effort", "medium")
+
+                      forward(self, body, route)
+
+                  except Exception as exc:
+                      print(f"router error: {exc!r}", flush=True)
+                      try:
+                          send_json(self, 502, {
+                              "error": {
+                                  "message": "Local AI workers unavailable",
+                                  "type": "cluster_error",
+                              }
+                          })
+                      except Exception:
+                          pass
+
+          print(
+              f"Local AI Auto router: general={GENERAL_IP}:9001 "
+              f"coder={CODER_IP}:9002 thinking={THINKING}",
+              flush=True,
+          )
+          ThreadingHTTPServer(("127.0.0.1", 8000), Handler).serve_forever()
           PY
-        background: true
 
-      - name: Start Cloudflare named tunnel for WebUI only
-        id: cloudflare
-        if: ${{ inputs.tunnel == 'cloudflare-named' }}
+          python3 -m py_compile "$BASE/router.py"
+
+          nohup env \
+            CLUSTER_KEY="$CLUSTER_KEY" \
+            GENERAL_IP="$GENERAL_IP" \
+            CODER_IP="$CODER_IP" \
+            THINKING_DEFAULT="${{ inputs.thinking }}" \
+            python3 "$BASE/router.py" \
+            >"$BASE/logs/router.log" 2>&1 &
+
+          echo $! > "$BASE/router.pid"
+
+          for i in {1..60}; do
+            if curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1; then
+              echo "Local AI Auto router ready."
+              exit 0
+            fi
+            sleep 1
+          done
+
+          tail -100 "$BASE/logs/router.log" || true
+          echo "::error::Router gagal start."
+          exit 1
+
+      - name: End-to-end cluster preflight
         shell: bash
         run: |
           set -euo pipefail
-          exec "$BASE/bin/cloudflared" tunnel \
-            --no-autoupdate \
-            run \
-            --token "$CF_TUNNEL_TOKEN"
-        background: true
 
-      - name: Publish WebUI URL
-        id: public
+          BODY='{
+            "model":"local-auto",
+            "messages":[{"role":"user","content":"Balas hanya OK"}],
+            "stream":false,
+            "temperature":0,
+            "max_tokens":16
+          }'
+
+          START="$(date +%s)"
+          OUT="$(curl -fsS --max-time 300 \
+            -H "Authorization: Bearer $CLUSTER_KEY" \
+            -H 'Content-Type: application/json' \
+            -d "$BODY" \
+            http://127.0.0.1:8000/v1/chat/completions)"
+          END="$(date +%s)"
+
+          TEXT="$(echo "$OUT" | jq -r '.choices[0].message.content // empty' | head -c 120)"
+          echo "Cluster answer: $TEXT"
+          echo "End-to-end preflight: $((END - START))s"
+
+          {
+            echo
+            echo "## ⚡ Cluster preflight"
+            echo
+            echo "- Virtual model: \`local-auto\`"
+            echo "- End-to-end request: **$((END - START))s**"
+            echo "- Auto routing: **enabled**"
+            echo "- Worker failover: **enabled**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Start public tunnel and resolve WEBUI_URL
         shell: bash
         run: |
           set -euo pipefail
 
           if [ "${{ inputs.tunnel }}" = "ngrok-stable" ]; then
+            curl --proto '=https' --tlsv1.2 -fsSL \
+              https://bin.ngrok.com/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz \
+              | tar -xz -C "$BASE/bin"
+
+            chmod 700 "$BASE/bin/ngrok"
+
+            "$BASE/bin/ngrok" config add-authtoken "$NGROK_AUTHTOKEN" \
+              --config "$BASE/ngrok.yml" >/dev/null
+
+            nohup "$BASE/bin/ngrok" http 8080 \
+              --config "$BASE/ngrok.yml" \
+              --log stdout \
+              --log-format json \
+              >"$BASE/logs/ngrok.log" 2>&1 &
+
+            echo $! > "$BASE/tunnel.pid"
+
             URL=""
             for i in {1..90}; do
-              [ -s "$BASE/public-url.txt" ] && URL="$(cat "$BASE/public-url.txt")"
+              URL="$(curl -fsS http://127.0.0.1:4040/api/tunnels 2>/dev/null \
+                | jq -r '.tunnels[]? | select(.proto == "https") | .public_url' \
+                | head -1 || true)"
               [ -n "$URL" ] && break
               sleep 1
             done
-            [ -n "$URL" ] || { echo "::error::ngrok URL tidak ditemukan."; exit 1; }
 
-            READY=0
-            for i in {1..90}; do
-              if curl -fsS --max-time 10 \
-                -H 'ngrok-skip-browser-warning: 1' \
-                "$URL/" >/dev/null 2>&1; then
-                READY=1
-                break
-              fi
-              sleep 2
-            done
+            if [ -z "$URL" ]; then
+              tail -100 "$BASE/logs/ngrok.log" || true
+              echo "::error::ngrok tidak menghasilkan URL."
+              exit 1
+            fi
           else
+            curl --proto '=https' --tlsv1.2 -fsSL \
+              https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+              -o "$BASE/bin/cloudflared"
+            chmod 700 "$BASE/bin/cloudflared"
+
+            nohup "$BASE/bin/cloudflared" tunnel \
+              --no-autoupdate \
+              run \
+              --token "$CF_TUNNEL_TOKEN" \
+              >"$BASE/logs/cloudflared.log" 2>&1 &
+
+            echo $! > "$BASE/tunnel.pid"
             URL="$CF_PUBLIC_URL"
-            READY=0
-            for i in {1..90}; do
-              if curl -fsS --max-time 10 "$URL/" >/dev/null 2>&1; then
-                READY=1
-                break
-              fi
-              sleep 2
-            done
           fi
 
-          [ "$READY" = "1" ] || {
-            echo "::error::Public WebUI URL belum dapat dijangkau."
-            exit 1
-          }
+          echo "PUBLIC_URL=$URL" >> "$GITHUB_ENV"
+          echo "Public URL allocated."
 
-          echo "url=$URL" >> "$GITHUB_OUTPUT"
+      - name: Pull pinned Open WebUI
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull ghcr.io/open-webui/open-webui:v0.11.1
+
+      - name: Start Open WebUI on virtual model
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WEBUI_SECRET_KEY="$(openssl rand -hex 32)"
+
+          if [ "${{ inputs.web }}" = "on" ]; then
+            WEB_ENABLED=True
+            WEB_CAP=true
+            BUILTIN_TOOLS=true
+            FEATURES='["web_search"]'
+          else
+            WEB_ENABLED=False
+            WEB_CAP=false
+            BUILTIN_TOOLS=false
+            FEATURES='[]'
+          fi
+
+          MODEL_METADATA="$(jq -cn \
+            --argjson webcap "$WEB_CAP" \
+            --argjson builtin "$BUILTIN_TOOLS" \
+            --argjson features "$FEATURES" \
+            '{
+              capabilities:{
+                vision:true,
+                file_context:true,
+                file_upload:true,
+                web_search:$webcap,
+                citations:true,
+                builtin_tools:$builtin,
+                code_interpreter:false,
+                image_generation:false,
+                memory:false
+              },
+              defaultFeatureIds:$features,
+              builtinTools:{
+                time:false,
+                user_input:false,
+                files:false,
+                knowledge:false,
+                chats:false,
+                subagents:false,
+                memory:false,
+                web_search:$webcap,
+                image_generation:false,
+                code_interpreter:false,
+                notes:false,
+                channels:false,
+                tasks:false,
+                automations:false,
+                calendar:false,
+                notifications:false
+              }
+            }'
+          )"
+
+          MODEL_PARAMS='{"function_calling":"native"}'
+
+          docker rm -f open-webui 2>/dev/null || true
+
+          docker run -d \
+            --name open-webui \
+            --network host \
+            --cpus=2.5 \
+            --memory=4g \
+            --memory-swap=6g \
+            --ulimit nofile=65536:65536 \
+            \
+            -e ENABLE_OLLAMA_API=False \
+            -e ENABLE_OPENAI_API=True \
+            -e OPENAI_API_BASE_URL=http://127.0.0.1:8000/v1 \
+            -e OPENAI_API_KEY="$CLUSTER_KEY" \
+            -e OPENAI_API_CONFIGS='{"0":{"enable":true,"prefix_id":"","model_ids":["local-auto"]}}' \
+            \
+            -e WEBUI_URL="$PUBLIC_URL" \
+            -e WEBUI_SECRET_KEY="$WEBUI_SECRET_KEY" \
+            -e WEBUI_AUTH=True \
+            -e WEBUI_ADMIN_EMAIL=admin@local.ai \
+            -e WEBUI_ADMIN_PASSWORD="$LOCAL_AI_PASSWORD" \
+            -e WEBUI_ADMIN_NAME="Local AI Admin" \
+            -e ENABLE_SIGNUP=False \
+            -e ENABLE_PERSISTENT_CONFIG=False \
+            \
+            -e DEFAULT_MODELS=local-auto \
+            -e DEFAULT_PINNED_MODELS=local-auto \
+            -e DEFAULT_MODEL_PARAMS="$MODEL_PARAMS" \
+            -e DEFAULT_MODEL_METADATA="$MODEL_METADATA" \
+            -e DEFAULT_INTERFACE_SETTINGS='{"webSearch":"always"}' \
+            \
+            -e ENABLE_AUTOCOMPLETE_GENERATION=False \
+            -e ENABLE_FOLLOW_UP_GENERATION=False \
+            -e ENABLE_TITLE_GENERATION=False \
+            -e ENABLE_TAGS_GENERATION=False \
+            -e ENABLE_REALTIME_CHAT_SAVE=False \
+            \
+            -e ENABLE_CALENDAR=False \
+            -e ENABLE_AUTOMATIONS=False \
+            -e ENABLE_NOTES=False \
+            -e ENABLE_MEMORIES=False \
+            -e ENABLE_MEMORY_SYSTEM_CONTEXT=False \
+            -e ENABLE_CHANNELS=False \
+            -e ENABLE_SUBAGENTS=False \
+            -e ENABLE_CODE_INTERPRETER=False \
+            -e ENABLE_IMAGE_GENERATION=False \
+            -e ENABLE_PLUGINS=False \
+            \
+            -e DATABASE_POOL_SIZE=8 \
+            -e DATABASE_POOL_MAX_OVERFLOW=0 \
+            -e DATABASE_ENABLE_SESSION_SHARING=False \
+            -e DATABASE_ENABLE_SQLITE_WAL=True \
+            -e DATABASE_SQLITE_PRAGMA_SYNCHRONOUS=NORMAL \
+            -e DATABASE_SQLITE_PRAGMA_CACHE_SIZE=-2000 \
+            -e DATABASE_SQLITE_PRAGMA_MMAP_SIZE=0 \
+            \
+            -e ENABLE_WEB_SEARCH="$WEB_ENABLED" \
+            -e USER_PERMISSIONS_FEATURES_WEB_SEARCH="$WEB_ENABLED" \
+            -e ENABLE_WEB_SEARCH_CONFIRMATION=False \
+            -e WEB_SEARCH_ENGINE=duckduckgo \
+            -e DDGS_BACKEND=auto \
+            -e WEB_SEARCH_RESULT_COUNT=3 \
+            -e WEB_SEARCH_CONCURRENT_REQUESTS=1 \
+            -e WEB_LOADER_CONCURRENT_REQUESTS=1 \
+            -e WEB_FETCH_MAX_CONTENT_LENGTH=12000 \
+            -e BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL=True \
+            -e BYPASS_WEB_SEARCH_WEB_LOADER=True \
+            \
+            -e AIOHTTP_CLIENT_TIMEOUT=1800 \
+            -e AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST=15 \
+            -e AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST=15 \
+            \
+            -v "$BASE/openwebui-data:/app/backend/data" \
+            ghcr.io/open-webui/open-webui:v0.11.1
+
+          echo "Open WebUI container started."
+
+      - name: Verify WebUI + internet + public endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for i in {1..180}; do
+            if curl -fsS http://127.0.0.1:8080/ >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+
+          if ! curl -fsS http://127.0.0.1:8080/ >/dev/null 2>&1; then
+            docker logs --tail 300 open-webui || true
+            echo "::error::Open WebUI local gagal start."
+            exit 1
+          fi
+
+          docker exec open-webui python - <<'PY'
+          import urllib.request
+          req = urllib.request.Request(
+              "https://duckduckgo.com/?q=open+webui",
+              headers={"User-Agent":"Mozilla/5.0"}
+          )
+          with urllib.request.urlopen(req, timeout=20) as r:
+              print("Outbound internet HTTP:", r.status)
+          PY
+
+          READY=0
+          for i in {1..120}; do
+            if [ "${{ inputs.tunnel }}" = "ngrok-stable" ]; then
+              if curl -fsS --max-time 10 \
+                -H 'ngrok-skip-browser-warning: 1' \
+                "$PUBLIC_URL/" >/dev/null 2>&1; then
+                READY=1
+                break
+              fi
+            else
+              if curl -fsS --max-time 10 "$PUBLIC_URL/" >/dev/null 2>&1; then
+                READY=1
+                break
+              fi
+            fi
+            sleep 2
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            echo "::error::Public WebUI belum dapat dijangkau."
+            exit 1
+          fi
+
+          echo "Open WebUI public: READY"
+
+      - name: Final cluster summary
+        shell: bash
+        run: |
+          set -euo pipefail
 
           {
             echo
-            echo "## ✅ Local AI ready"
+            echo "## ✅ Local AI Cluster v2.0 READY"
             echo
-            echo "WebUI: **$URL**"
+            echo "- WebUI: **$PUBLIC_URL**"
+            echo "- Login: \`admin@local.ai\`"
+            echo "- Password: secret \`LOCAL_AI_PASSWORD\`"
+            echo "- Visible model: **local-auto**"
+            echo "- General worker: \`${{ inputs.general_model }}\`"
+            echo "- Coder worker: \`${{ inputs.coder_model }}\`"
+            echo "- Context per worker: **${{ inputs.context }}**"
+            echo "- Thinking: **${{ inputs.thinking }}**"
+            echo "- Web Search: **${{ inputs.web }}**"
             echo
-            echo "Email: \`admin@local.ai\`"
+            echo "### Engine"
+            echo "- 3 GitHub jobs / 3 fresh VMs"
+            echo "- General and coder models download in parallel"
+            echo "- Ollama is localhost-only on both workers"
+            echo "- Worker API is Tailscale-only + per-run bearer token"
+            echo "- Router automatically selects General vs Coder"
+            echo "- Router falls back to the other worker if one fails"
+            echo "- Only Open WebUI is publicly tunneled"
             echo
-            echo "Password: secret \`LOCAL_AI_PASSWORD\`"
-            echo
-            echo "Model dipasang langsung di runner: \`${{ steps.model.outputs.name }}\`"
-            echo
-            echo "Ollama tetap private di \`127.0.0.1:11434\`; hanya Open WebUI port 8080 yang ditunnel."
+            echo "### Routing examples"
+            echo "- \`Halo\` → General"
+            echo "- \`Cari berita terbaru ...\` → General + Native Web Search"
+            echo "- \`Debug Kotlin/Gradle/APK ...\` → Coder"
+            echo "- Image input → General vision model"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "========================================================"
-          echo " LOCAL AI READY"
-          echo " $URL"
-          echo "========================================================"
+          echo "======================================================"
+          echo " LOCAL AI CLUSTER READY"
+          echo " $PUBLIC_URL"
+          echo " Model shown in UI: local-auto"
+          echo "======================================================"
 
-      - name: Keep runner alive
+      - name: Keep frontend alive
         shell: bash
-        env:
-          PUBLIC_URL: ${{ steps.public.outputs.url }}
         run: |
           set -euo pipefail
-          echo "AI aktif. Stop workflow kalau sudah selesai."
+
+          WARN_G=0
+          WARN_C=0
 
           while true; do
-            docker ps --format '{{.Names}}' | grep -qx open-webui || {
-              echo "::error::Open WebUI berhenti."
-              docker logs --tail 250 open-webui || true
+            if ! docker ps --format '{{.Names}}' | grep -qx open-webui; then
+              echo "::error::Open WebUI stopped."
+              docker logs --tail 300 open-webui || true
               exit 1
-            }
+            fi
 
-            curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1 || {
-              echo "::error::Ollama local berhenti."
+            if ! kill -0 "$(cat "$BASE/router.pid")" 2>/dev/null; then
+              echo "::error::Router stopped."
+              tail -200 "$BASE/logs/router.log" || true
               exit 1
-            }
+            fi
+
+            if curl -fsS --max-time 3 \
+              -H "Authorization: Bearer $CLUSTER_KEY" \
+              "http://${GENERAL_IP}:9001/health" >/dev/null 2>&1; then
+              WARN_G=0
+            else
+              WARN_G=$((WARN_G + 1))
+              [ "$WARN_G" -ne 1 ] || echo "::warning::General worker temporarily unavailable; router can use coder fallback."
+            fi
+
+            if curl -fsS --max-time 3 \
+              -H "Authorization: Bearer $CLUSTER_KEY" \
+              "http://${CODER_IP}:9002/health" >/dev/null 2>&1; then
+              WARN_C=0
+            else
+              WARN_C=$((WARN_C + 1))
+              [ "$WARN_C" -ne 1 ] || echo "::warning::Coder worker temporarily unavailable; router can use general fallback."
+            fi
 
             sleep 60
           done
-
-      - wait-all:
-      
+          
