@@ -1,12 +1,49 @@
-name: Local AI Launcher Hardened v1.3
+name: Local AI Runner v1.4
 
 on:
   workflow_dispatch:
+    inputs:
+      model:
+        description: "Model yang dipasang langsung di runner"
+        required: true
+        type: choice
+        default: qwen3:8b
+        options:
+          - qwen3:8b
+          - qwen3:14b
+          - qwen2.5:14b
+          - qwen2.5-coder:7b
+          - qwen2.5-coder:14b
+          - custom-ollama
+          - custom-gguf
 
-# Tidak memberi GITHUB_TOKEN permission apa pun.
+      custom_model:
+        description: "Isi hanya jika Custom: nama Ollama atau direct HTTPS .gguf URL"
+        required: false
+        type: string
+        default: ""
+
+      context:
+        description: "Context length"
+        required: true
+        type: choice
+        default: "8192"
+        options:
+          - "4096"
+          - "8192"
+          - "16384"
+
+      tunnel:
+        description: "WebUI tunnel (model TIDAK lewat selector/tunnel)"
+        required: true
+        type: choice
+        default: ngrok-stable
+        options:
+          - ngrok-stable
+          - cloudflare-named
+
 permissions: {}
 
-# Hanya satu instance AI aktif pada repo ini.
 concurrency:
   group: local-ai-${{ github.repository }}
   cancel-in-progress: true
@@ -18,158 +55,88 @@ jobs:
 
     env:
       BASE: /home/runner/localai
-      SELECT_FILE: /home/runner/localai/selection.json
-      STATUS_FILE: /home/runner/localai/status.txt
       OLLAMA_MODELS: /home/runner/localai/models
       LOCAL_AI_PASSWORD: ${{ secrets.LOCAL_AI_PASSWORD }}
       NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+      CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+      CF_PUBLIC_URL: ${{ vars.CF_PUBLIC_URL }}
 
     steps:
-      - name: Harden runner and authorize owner
+      - name: Authorize owner and prepare runner
         shell: bash
         run: |
           set -euo pipefail
           umask 077
 
-          # Extra guard: hanya pemilik repository yang boleh meneruskan job.
           if [ "$GITHUB_ACTOR" != "$GITHUB_REPOSITORY_OWNER" ]; then
-            echo "::error::Workflow ini hanya boleh dijalankan oleh repository owner."
+            echo "::error::Hanya repository owner yang boleh menjalankan workflow ini."
             exit 1
           fi
 
           if [ -z "${LOCAL_AI_PASSWORD:-}" ]; then
-            echo "::error::Repository secret LOCAL_AI_PASSWORD belum dibuat."
+            echo "::error::Secret LOCAL_AI_PASSWORD belum dibuat."
             exit 1
           fi
 
-          if [ -z "${NGROK_AUTHTOKEN:-}" ]; then
-            echo "::error::Repository secret NGROK_AUTHTOKEN belum dibuat."
-            echo "::error::Secret ini diperlukan untuk URL ngrok yang tetap sama antar workflow run."
-            exit 1
-          fi
-
-          # Tambahan masking; GitHub Secrets sendiri juga dimask.
           echo "::add-mask::$LOCAL_AI_PASSWORD"
-          echo "::add-mask::$NGROK_AUTHTOKEN"
-
-          mkdir -p "$BASE"
-          chmod 700 "$BASE"
-
-          echo "Owner check: OK"
-          echo "GITHUB_TOKEN permissions: none"
-          echo "Repository tidak di-checkout."
-
-      - name: Prepare private workspace
-        shell: bash
-        run: |
-          set -euo pipefail
-          umask 077
+          [ -n "${NGROK_AUTHTOKEN:-}" ] && echo "::add-mask::$NGROK_AUTHTOKEN"
+          [ -n "${CF_TUNNEL_TOKEN:-}" ] && echo "::add-mask::$CF_TUNNEL_TOKEN"
 
           mkdir -p \
-            "$BASE/bin" \
             "$BASE/models" \
             "$BASE/openwebui-data" \
-            "$BASE/workspace/uploads" \
-            "$BASE/workspace/projects" \
-            "$BASE/workspace/outputs" \
             "$BASE/custom" \
-            "$BASE/logs"
-
+            "$BASE/workspace" \
+            "$BASE/logs" \
+            "$BASE/bin"
           chmod -R go-rwx "$BASE"
-          rm -f "$SELECT_FILE"
-          echo "Launcher sedang disiapkan..." > "$STATUS_FILE"
 
-          echo "===== SYSTEM ====="
-          uname -a
+          echo "===== RUNNER ====="
+          echo "Model input : ${{ inputs.model }}"
+          echo "Context     : ${{ inputs.context }}"
+          echo "Tunnel      : ${{ inputs.tunnel }}"
           echo
-          echo "===== DISK ====="
-          df -h /
-          echo
-          echo "===== RAM ====="
-          free -h
-          echo
-          echo "===== CPU ====="
           nproc
+          free -h
+          df -h /
 
-      - name: Create secure model selector
+      - name: Resolve and validate model
+        id: selected
         shell: bash
+        env:
+          INPUT_MODEL: ${{ inputs.model }}
+          CUSTOM_MODEL: ${{ inputs.custom_model }}
         run: |
           set -euo pipefail
           umask 077
 
-          cat > "$BASE/launcher.py" <<'PY'
-          import os
-          import json
-          import html
-          import hmac
-          import re
-          import tempfile
-          import socket
-          import ipaddress
-          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-          from urllib.parse import parse_qs, urlparse
+          python3 - <<'PY'
+          import os, re, sys, socket, ipaddress
+          from urllib.parse import urlparse
 
-          SELECT_FILE = os.environ["SELECT_FILE"]
-          STATUS_FILE = os.environ["STATUS_FILE"]
-          PASSWORD = os.environ["LOCAL_AI_PASSWORD"]
+          preset = os.environ["INPUT_MODEL"].strip()
+          custom = os.environ.get("CUSTOM_MODEL", "").strip()
 
-          PRESETS = [
-              ("qwen3:8b", "Qwen 3 8B — disarankan untuk general chat"),
-              ("qwen3:14b", "Qwen 3 14B — lebih berat"),
-              ("qwen2.5:14b", "Qwen 2.5 14B"),
-              ("qwen2.5-coder:7b", "Qwen 2.5 Coder 7B"),
-              ("qwen2.5-coder:14b", "Qwen 2.5 Coder 14B — berat"),
-              ("custom_ollama", "Custom Ollama model"),
-              ("custom_gguf", "Custom GGUF URL / Abliterated"),
-          ]
+          allowed = {
+              "qwen3:8b",
+              "qwen3:14b",
+              "qwen2.5:14b",
+              "qwen2.5-coder:7b",
+              "qwen2.5-coder:14b",
+          }
 
-          MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,180}(?::[A-Za-z0-9._-]{1,80})?$")
+          model_re = re.compile(
+              r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,180}(?::[A-Za-z0-9._-]{1,80})?$"
+          )
 
-          CSS = """
-          :root{color-scheme:dark}
-          *{box-sizing:border-box}
-          body{margin:0;min-height:100vh;display:grid;place-items:center;
-          background:#0b0d10;color:#f4f6fb;font-family:system-ui,-apple-system,Segoe UI,sans-serif;padding:18px}
-          .card{width:min(100%,590px);background:#151922;border:1px solid #2a3140;
-          border-radius:22px;padding:24px;box-shadow:0 24px 70px #0007}
-          h1{margin:0 0 8px;font-size:28px}
-          p{color:#a7afbd;line-height:1.5}
-          label{display:block;margin:16px 0 7px;font-weight:700}
-          select,input{width:100%;padding:14px;border-radius:13px;border:1px solid #2a3140;
-          background:#0f131a;color:#fff;font-size:16px}
-          button{width:100%;margin-top:20px;padding:15px;border:0;border-radius:14px;
-          font-size:16px;font-weight:800;background:#fff;color:#090a0c}
-          .note{margin-top:16px;padding:13px;border:1px solid #2a3140;border-radius:13px;color:#a7afbd}
-          .ok{color:#a8f0b5}.bad{color:#ffaaaa}
-          """
-
-          def status_text():
+          def public_https(url):
               try:
-                  with open(STATUS_FILE, "r", encoding="utf-8") as f:
-                      return f.read().strip()
-              except Exception:
-                  return "Sedang menyiapkan..."
-
-          def already_selected():
-              return os.path.exists(SELECT_FILE) and os.path.getsize(SELECT_FILE) > 0
-
-          def page(body, refresh=None):
-              meta = f'<meta http-equiv="refresh" content="{int(refresh)}">' if refresh else ""
-              return f"""<!doctype html><html><head><meta charset="utf-8">
-              <meta name="viewport" content="width=device-width,initial-scale=1">
-              {meta}<title>Local AI</title><style>{CSS}</style></head>
-              <body><main class="card">{body}</main></body></html>""".encode("utf-8")
-
-          def is_public_https_url(value):
-              try:
-                  u = urlparse(value)
+                  u = urlparse(url)
                   if u.scheme != "https" or not u.hostname or u.username or u.password:
                       return False
                   host = u.hostname.lower().rstrip(".")
-                  if host in {"localhost"} or host.endswith(".local"):
+                  if host == "localhost" or host.endswith(".local"):
                       return False
-
-                  # Hindari URL internal/private jika launcher password bocor.
                   infos = socket.getaddrinfo(host, u.port or 443, type=socket.SOCK_STREAM)
                   if not infos:
                       return False
@@ -182,435 +149,91 @@ jobs:
               except Exception:
                   return False
 
-          def atomic_write(data):
-              os.makedirs(os.path.dirname(SELECT_FILE), exist_ok=True)
-              fd, tmp = tempfile.mkstemp(prefix="selection-", suffix=".json",
-                                         dir=os.path.dirname(SELECT_FILE))
-              try:
-                  with os.fdopen(fd, "w", encoding="utf-8") as f:
-                      json.dump(data, f)
-                  os.replace(tmp, SELECT_FILE)
-              finally:
-                  if os.path.exists(tmp):
-                      os.unlink(tmp)
-
-          class H(BaseHTTPRequestHandler):
-              server_version = "LocalAILauncher/1.3"
-
-              def log_message(self, fmt, *args):
-                  # Tidak log form body/password.
-                  print("%s - %s" % (self.address_string(), fmt % args), flush=True)
-
-              def send_bytes(self, body, code=200, ctype="text/html; charset=utf-8"):
-                  self.send_response(code)
-                  self.send_header("Content-Type", ctype)
-                  self.send_header("Cache-Control", "no-store")
-                  self.send_header("X-Content-Type-Options", "nosniff")
-                  self.send_header("X-Frame-Options", "DENY")
-                  self.send_header("Referrer-Policy", "no-referrer")
-                  self.send_header("Content-Security-Policy",
-                                   "default-src 'self' 'unsafe-inline'; frame-ancestors 'none'")
-                  self.send_header("Content-Length", str(len(body)))
-                  self.end_headers()
-                  self.wfile.write(body)
-
-              def do_GET(self):
-                  if self.path == "/health":
-                      self.send_bytes(b"ok", 200, "text/plain")
-                      return
-
-                  if already_selected():
-                      body = (
-                          "<h1>Local AI sedang disiapkan</h1>"
-                          f"<p class='ok'><b>{html.escape(status_text())}</b></p>"
-                          "<p>Halaman refresh otomatis. URL yang sama akan menjadi Open WebUI.</p>"
-                          "<div class='note'>Jika sempat muncul 502 saat perpindahan service, refresh beberapa detik kemudian.</div>"
-                      )
-                      self.send_bytes(page(body, 5))
-                      return
-
-                  opts = "".join(
-                      f'<option value="{html.escape(v)}">{html.escape(label)}</option>'
-                      for v, label in PRESETS
-                  )
-                  body = f"""
-                  <h1>Local AI Launcher</h1>
-                  <p>Runner sudah hidup. Pilih model yang mau didownload.</p>
-
-                  <form method="post" action="/select">
-                    <label>Password</label>
-                    <input type="password" name="password" autocomplete="current-password" required>
-
-                    <label>Model</label>
-                    <select name="preset" id="preset" onchange="toggleCustom()">{opts}</select>
-
-                    <div id="customBox" style="display:none">
-                      <label id="customLabel">Custom model</label>
-                      <input id="custom" name="custom" type="text"
-                        placeholder="Ollama model atau direct HTTPS GGUF URL">
-                    </div>
-
-                    <label>Context length</label>
-                    <select name="context">
-                      <option value="4096">4096 — paling hemat RAM</option>
-                      <option value="8192" selected>8192 — balanced</option>
-                      <option value="16384">16384 — lebih berat</option>
-                    </select>
-
-                    <button type="submit">START AI</button>
-                  </form>
-
-                  <div class="note">
-                    <b>Untuk test pertama:</b> Qwen 3 8B + context 8192.<br>
-                    Untuk Qwen Abliterated GGUF pilih <b>Custom GGUF URL</b>.
-                  </div>
-
-                  <script>
-                  function toggleCustom(){{
-                    const p=document.getElementById("preset").value;
-                    const custom=(p==="custom_ollama"||p==="custom_gguf");
-                    document.getElementById("customBox").style.display=custom?"block":"none";
-                    document.getElementById("custom").required=custom;
-                    document.getElementById("customLabel").innerText=
-                      p==="custom_gguf"?"Direct HTTPS GGUF URL":"Ollama model name";
-                  }}
-                  toggleCustom();
-                  </script>
-                  """
-                  self.send_bytes(page(body))
-
-              def do_POST(self):
-                  if self.path != "/select":
-                      self.send_error(404)
-                      return
-                  if already_selected():
-                      self.send_bytes(page("<h1>Model sudah dipilih</h1><p>Setup sedang berjalan.</p>", 4))
-                      return
-
-                  try:
-                      length = int(self.headers.get("Content-Length", "0"))
-                  except ValueError:
-                      self.send_error(400)
-                      return
-
-                  if length <= 0 or length > 8192:
-                      self.send_error(413)
-                      return
-
-                  raw = self.rfile.read(length).decode("utf-8", "replace")
-                  q = parse_qs(raw, keep_blank_values=True)
-
-                  supplied = q.get("password", [""])[0]
-                  if not hmac.compare_digest(supplied, PASSWORD):
-                      self.send_bytes(page(
-                          "<h1>Password salah</h1><p class='bad'>Gunakan nilai LOCAL_AI_PASSWORD.</p>"
-                      ), 403)
-                      return
-
-                  preset = q.get("preset", [""])[0]
-                  custom = q.get("custom", [""])[0].strip()
-                  context = q.get("context", ["8192"])[0]
-                  if context not in {"4096", "8192", "16384"}:
-                      context = "8192"
-
-                  preset_ids = {v for v, _ in PRESETS}
-
-                  if preset == "custom_ollama":
-                      if not MODEL_RE.fullmatch(custom):
-                          self.send_bytes(page("<h1>Nama model tidak valid</h1>"), 400)
-                          return
-                      kind, model = "ollama", custom
-                  elif preset == "custom_gguf":
-                      if len(custom) > 2048 or not is_public_https_url(custom):
-                          self.send_bytes(page(
-                              "<h1>GGUF URL ditolak</h1>"
-                              "<p>Harus HTTPS publik dan tidak boleh menunjuk IP/private network.</p>"
-                          ), 400)
-                          return
-                      kind, model = "gguf", custom
-                  else:
-                      if preset not in preset_ids or preset.startswith("custom_"):
-                          self.send_error(400)
-                          return
-                      kind, model = "ollama", preset
-
-                  atomic_write({
-                      "kind": kind,
-                      "model": model,
-                      "context": int(context),
-                  })
-
-                  with open(STATUS_FILE, "w", encoding="utf-8") as f:
-                      f.write("Pilihan diterima. Workflow melanjutkan setup...")
-
-                  self.send_bytes(page(
-                      f"<h1>Pilihan diterima ✅</h1>"
-                      f"<p><b>{html.escape(model)}</b></p>"
-                      "<p>Workflow akan download model, mengetes inference, lalu menyalakan Open WebUI.</p>",
-                      5
-                  ))
-
-          ThreadingHTTPServer(("127.0.0.1", 8080), H).serve_forever()
-          PY
-
-          chmod 600 "$BASE/launcher.py"
-          python3 -m py_compile "$BASE/launcher.py"
-          echo "Secure launcher: OK"
-
-      - name: Install pinned ngrok SDK
-        shell: bash
-        run: |
-          set -euo pipefail
-          umask 077
-
-          # Official ngrok Python SDK. Pinned supaya workflow public tidak
-          # otomatis mengambil versi baru tanpa kita review.
-          python3 -m pip install --user --disable-pip-version-check "ngrok==1.7.0"
-          python3 - <<'PY'
-          import ngrok
-          print("ngrok SDK import: OK")
-          PY
-
-      - name: Start model selector
-        id: selector
-        shell: bash
-        run: |
-          set -euo pipefail
-          umask 077
-          echo "Menunggu pilihan model..." > "$STATUS_FILE"
-          exec python3 "$BASE/launcher.py"
-        background: true
-
-      - name: Wait for local selector
-        shell: bash
-        run: |
-          set -euo pipefail
-          for i in {1..45}; do
-            if curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1; then
-              echo "Launcher local: OK"
-              exit 0
-            fi
-            sleep 1
-          done
-
-          echo "::error::Launcher tidak merespons di localhost:8080."
-          exit 1
-
-      - name: Start stable ngrok URL
-        id: ngrok_tunnel
-        shell: bash
-        env:
-          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
-        run: |
-          set -euo pipefail
-          umask 077
-
-          exec python3 - <<'PY'
-          import os
-          import time
-          import ngrok
-
-          base = os.environ["BASE"]
-          url_file = os.path.join(base, "public-url.txt")
-
-          # Pada ngrok Free, akun mendapat satu assigned development domain.
-          # Domain ini dipakai ulang pada run berikutnya, jadi URL tetap.
-          listener = ngrok.forward(8080, authtoken_from_env=True)
-          url = listener.url()
-
-          with open(url_file, "w", encoding="utf-8") as f:
-              f.write(url)
-
-          print("ngrok endpoint started", flush=True)
-
-          # Pertahankan listener selama GitHub job hidup.
-          while True:
-              time.sleep(3600)
-          PY
-        background: true
-
-      - name: Verify and publish one stable URL
-        id: tunnel
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          URL=""
-          for i in {1..90}; do
-            if [ -s "$BASE/public-url.txt" ]; then
-              URL="$(cat "$BASE/public-url.txt")"
-              [ -n "$URL" ] && break
-            fi
-            sleep 1
-          done
-
-          if [ -z "$URL" ]; then
-            echo "::error::ngrok tidak menghasilkan URL."
-            exit 1
-          fi
-
-          # Jangan tampilkan URL sebelum benar-benar bisa dipakai dari Internet.
-          # Header ini melewati halaman peringatan ngrok pada health-check CLI.
-          READY=0
-          for i in {1..90}; do
-            BODY="$(curl -fsS --max-time 10 \
-              -H 'ngrok-skip-browser-warning: 1' \
-              "$URL/health" 2>/dev/null || true)"
-            if [ "$BODY" = "ok" ]; then
-              READY=1
-              break
-            fi
-            sleep 2
-          done
-
-          if [ "$READY" != "1" ]; then
-            echo "::error::URL ngrok dibuat tetapi belum dapat mencapai launcher."
-            exit 1
-          fi
-
-          echo "url=$URL" >> "$GITHUB_OUTPUT"
-
-          {
-            echo "## 🚀 Local AI"
-            echo
-            echo "Buka dari HP: **$URL**"
-            echo
-            echo "URL ngrok Free assigned domain ini tetap sama pada run berikutnya selama memakai akun ngrok yang sama."
-            echo
-            echo "Selector dan Open WebUI memakai URL yang sama."
-            echo
-            echo "Password = repository secret \`LOCAL_AI_PASSWORD\`."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          echo "========================================================"
-          echo " BUKA DARI HP:"
-          echo " $URL"
-          echo "========================================================"
-
-      - name: Wait for model selection
-        id: selection
-        shell: bash
-        env:
-          TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
-        run: |
-          set -euo pipefail
-          umask 077
-
-          echo "Menunggu pilihan dari HP..."
-
-          for i in {1..1800}; do
-            if [ -s "$SELECT_FILE" ]; then
-              break
-            fi
-
-            if ! curl -fsS --max-time 5 http://127.0.0.1:8080/health >/dev/null 2>&1; then
-              echo "::error::Launcher local berhenti merespons."
-              exit 1
-            fi
-
-            if ! curl -fsS --max-time 10               -H 'ngrok-skip-browser-warning: 1'               "$TUNNEL_URL/health" >/dev/null 2>&1; then
-              echo "::warning::URL publik sedang tidak merespons; mencoba lagi..."
-            fi
-
-            sleep 2
-          done
-
-          [ -s "$SELECT_FILE" ] || {
-            echo "::error::Timeout 60 menit menunggu pilihan model."
-            exit 1
-          }
-
-          python3 - <<'PY'
-          import os, json
-          with open(os.environ["SELECT_FILE"], encoding="utf-8") as f:
-              c = json.load(f)
-
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
-              f.write("kind=" + c["kind"] + "\n")
-              f.write("model=" + c["model"] + "\n")
-              f.write("context=" + str(c["context"]) + "\n")
-
-          print("Selection accepted")
-          print("kind:", c["kind"])
-          print("context:", c["context"])
-          # URL custom sengaja tidak dicetak penuh ke log.
-          if c["kind"] == "ollama":
-              print("model:", c["model"])
+          if preset in allowed:
+              kind, value = "ollama", preset
+          elif preset == "custom-ollama":
+              if not custom or not model_re.fullmatch(custom):
+                  print("Invalid custom Ollama model", file=sys.stderr)
+                  sys.exit(1)
+              kind, value = "ollama", custom
+          elif preset == "custom-gguf":
+              if not custom or len(custom) > 2048 or not public_https(custom):
+                  print("Custom GGUF harus berupa direct HTTPS URL publik.", file=sys.stderr)
+                  sys.exit(1)
+              kind, value = "gguf", custom
           else:
-              print("model: custom GGUF")
+              print("Unknown model preset", file=sys.stderr)
+              sys.exit(1)
+
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as f:
+              f.write(f"kind={kind}\n")
+              if kind == "ollama":
+                  f.write(f"value={value}\n")
+                  print("Resolved model:", value)
+              else:
+                  # URL GGUF tidak ditampilkan ke log.
+                  f.write("value<<EOF\n")
+                  f.write(value + "\n")
+                  f.write("EOF\n")
+                  print("Resolved model: custom GGUF")
           PY
 
       - name: Install Ollama
         shell: bash
         run: |
           set -euo pipefail
-          umask 077
-
-          echo "Installing Ollama..." > "$STATUS_FILE"
           curl --proto '=https' --tlsv1.2 -fsSL https://ollama.com/install.sh | sh
-
-          # Matikan service bawaan installer; instance workflow kita sendiri
-          # akan dijalankan sebagai background step resmi GitHub Actions.
           sudo systemctl stop ollama 2>/dev/null || true
           pkill -f "ollama serve" 2>/dev/null || true
           sleep 2
           ollama --version
 
-      - name: Start tuned Ollama
-        id: ollama_server
+      - name: Start Ollama on runner only
+        id: ollama
         shell: bash
         env:
-          SELECTED_CONTEXT: ${{ steps.selection.outputs.context }}
+          SELECTED_CONTEXT: ${{ inputs.context }}
         run: |
           set -euo pipefail
-          umask 077
-
-          echo "Starting Ollama..." > "$STATUS_FILE"
-
           export OLLAMA_HOST=127.0.0.1:11434
           export OLLAMA_MODELS="$OLLAMA_MODELS"
           export OLLAMA_CONTEXT_LENGTH="$SELECTED_CONTEXT"
           export OLLAMA_NUM_PARALLEL=1
           export OLLAMA_MAX_LOADED_MODELS=1
           export OLLAMA_KEEP_ALIVE=15m
-
           exec ollama serve
         background: true
 
-      - name: Wait for Ollama
+      - name: Wait for local Ollama
         shell: bash
         run: |
           set -euo pipefail
-
           for i in {1..75}; do
             if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
-              echo "Ollama API: OK"
+              echo "Ollama local API: OK"
               exit 0
             fi
             sleep 1
           done
-
-          echo "::error::Ollama tidak merespons di localhost:11434."
+          echo "::error::Ollama tidak merespons."
           exit 1
 
-      - name: Download selected model
+      - name: Install selected model directly on runner
         id: model
         shell: bash
         env:
-          MODEL_KIND: ${{ steps.selection.outputs.kind }}
-          MODEL_VALUE: ${{ steps.selection.outputs.model }}
-          SELECTED_CONTEXT: ${{ steps.selection.outputs.context }}
+          MODEL_KIND: ${{ steps.selected.outputs.kind }}
+          MODEL_VALUE: ${{ steps.selected.outputs.value }}
+          SELECTED_CONTEXT: ${{ inputs.context }}
         run: |
           set -euo pipefail
           umask 077
 
           if [ "$MODEL_KIND" = "ollama" ]; then
-            echo "Downloading selected Ollama model..." > "$STATUS_FILE"
             ollama pull "$MODEL_VALUE"
             FINAL_MODEL="$MODEL_VALUE"
-          elif [ "$MODEL_KIND" = "gguf" ]; then
-            echo "Downloading custom GGUF..." > "$STATUS_FILE"
-
+          else
             GGUF="$BASE/custom/model.gguf"
             curl --proto '=https' --tlsv1.2 \
               -fL --retry 3 --retry-delay 3 \
@@ -621,133 +244,103 @@ jobs:
           PARAMETER num_ctx $SELECTED_CONTEXT
           EOF
 
-            echo "Importing custom GGUF..." > "$STATUS_FILE"
             ollama create custom-gguf -f "$BASE/custom/Modelfile"
             FINAL_MODEL="custom-gguf"
-          else
-            echo "::error::Unknown model kind."
-            exit 1
           fi
 
-          chmod -R go-rwx "$BASE/models" "$BASE/custom" || true
           echo "name=$FINAL_MODEL" >> "$GITHUB_OUTPUT"
-          echo "Model downloaded. Running inference test..." > "$STATUS_FILE"
-
+          echo
           ollama list
+          echo
+          free -h
 
-      - name: Preflight real inference test
+      - name: Preflight inference without Qwen3 thinking
         shell: bash
         env:
           FINAL_MODEL: ${{ steps.model.outputs.name }}
         run: |
           set -euo pipefail
-          umask 077
-
-          echo "Testing model before Open WebUI..." > "$STATUS_FILE"
 
           python3 - <<'PY'
-          import json
-          import os
-          import time
-          import urllib.request
-          import sys
+          import json, os, time, urllib.request, sys
 
           model = os.environ["FINAL_MODEL"]
           payload = {
               "model": model,
-              "prompt": "Reply with exactly one word: OK",
+              "prompt": "Reply with exactly: OK",
               "stream": False,
+              "think": False,
               "keep_alive": "15m",
               "options": {
-                  "num_predict": 16,
+                  "num_predict": 32,
                   "temperature": 0
               }
           }
 
           req = urllib.request.Request(
               "http://127.0.0.1:11434/api/generate",
-              data=json.dumps(payload).encode("utf-8"),
-              headers={"Content-Type": "application/json"},
-              method="POST",
+              data=json.dumps(payload).encode(),
+              headers={"Content-Type":"application/json"},
+              method="POST"
           )
 
-          started = time.monotonic()
+          t0 = time.monotonic()
           try:
-              with urllib.request.urlopen(req, timeout=240) as r:
-                  data = json.loads(r.read().decode("utf-8"))
+              with urllib.request.urlopen(req, timeout=300) as r:
+                  data = json.loads(r.read().decode())
           except Exception as e:
-              print("PRE-FLIGHT FAILED:", repr(e))
+              print("PRE-FLIGHT ERROR:", repr(e))
               sys.exit(1)
 
-          wall = time.monotonic() - started
+          wall = time.monotonic() - t0
           response = (data.get("response") or "").strip()
-          eval_count = int(data.get("eval_count") or 0)
-          eval_ns = int(data.get("eval_duration") or 0)
-          load_ns = int(data.get("load_duration") or 0)
+          thinking = (data.get("thinking") or "").strip()
 
           if not response:
-              print("PRE-FLIGHT FAILED: empty response")
+              print("PRE-FLIGHT FAILED: final response kosong")
+              if thinking:
+                  print("Model menghasilkan thinking tetapi tidak final response.")
+              print(json.dumps({
+                  "done": data.get("done"),
+                  "done_reason": data.get("done_reason"),
+                  "eval_count": data.get("eval_count"),
+                  "prompt_eval_count": data.get("prompt_eval_count"),
+              }, indent=2))
               sys.exit(1)
 
-          tps = (eval_count / (eval_ns / 1e9)) if eval_count and eval_ns else 0.0
+          eval_count = int(data.get("eval_count") or 0)
+          eval_ns = int(data.get("eval_duration") or 0)
+          speed = eval_count / (eval_ns / 1e9) if eval_count and eval_ns else 0
 
-          print("===== MODEL PRE-FLIGHT =====")
+          print("===== PRE-FLIGHT PASS =====")
           print("Response:", response[:200])
           print(f"Wall time: {wall:.2f}s")
-          print(f"Load time: {load_ns/1e9:.2f}s")
-          print(f"Generated tokens: {eval_count}")
-          print(f"Generation speed: {tps:.2f} tok/s")
-          print("PRE-FLIGHT: PASS")
+          print(f"Speed: {speed:.2f} tok/s")
 
-          out = os.environ.get("GITHUB_STEP_SUMMARY")
-          if out:
-              with open(out, "a", encoding="utf-8") as f:
-                  f.write("\n## 🧪 Model pre-flight\n\n")
-                  f.write(f"- Model: `{model}`\n")
-                  f.write(f"- Test response: `{response[:80]}`\n")
-                  f.write(f"- Wall time: **{wall:.2f}s**\n")
-                  f.write(f"- Generation speed: **{tps:.2f} tok/s**\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write("## 🧪 Model test\n\n")
+              f.write(f"- Model: `{model}`\n")
+              f.write(f"- Response: `{response[:80]}`\n")
+              f.write(f"- Wall time: **{wall:.2f}s**\n")
+              f.write(f"- Speed: **{speed:.2f} tok/s**\n")
           PY
 
           echo
-          echo "===== OLLAMA PS ====="
           ollama ps || true
-          echo
-          echo "===== RAM AFTER LOAD ====="
           free -h
-
-          echo "Model test passed. Starting Open WebUI..." > "$STATUS_FILE"
 
       - name: Pull Open WebUI
         shell: bash
         run: |
           set -euo pipefail
-          echo "Downloading Open WebUI..." > "$STATUS_FILE"
           docker pull ghcr.io/open-webui/open-webui:main
 
-      - name: Stop model selector
-        cancel: selector
-
-      - name: Switch same stable URL to Open WebUI
+      - name: Start Open WebUI locally
         shell: bash
         env:
-          TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
           FINAL_MODEL: ${{ steps.model.outputs.name }}
         run: |
           set -euo pipefail
-          umask 077
-
-          echo "Starting Open WebUI..." > "$STATUS_FILE"
-
-          # Selector dihentikan oleh native GitHub background-step cancel.
-          # ngrok tetap hidup, jadi hostname publik tidak berubah.
-          for i in {1..30}; do
-            if ! curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1; then
-              break
-            fi
-            sleep 1
-          done
-
           WEBUI_SECRET_KEY="$(openssl rand -hex 32)"
 
           docker rm -f open-webui 2>/dev/null || true
@@ -755,91 +348,175 @@ jobs:
           docker run -d \
             --name open-webui \
             --network host \
-            --read-only=false \
             -e OLLAMA_BASE_URL=http://127.0.0.1:11434 \
-            -e WEBUI_URL="$TUNNEL_URL" \
             -e WEBUI_SECRET_KEY="$WEBUI_SECRET_KEY" \
             -e WEBUI_AUTH=True \
             -e WEBUI_ADMIN_EMAIL=admin@local.ai \
             -e WEBUI_ADMIN_PASSWORD="$LOCAL_AI_PASSWORD" \
             -e WEBUI_ADMIN_NAME="Local AI Admin" \
             -e ENABLE_SIGNUP=False \
-            -e DEFAULT_USER_ROLE=pending \
-            -e ENABLE_PLUGINS=False \
-            -e ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS=False \
-            -e USER_PERMISSIONS_WORKSPACE_TOOLS_ACCESS=False \
-            -e USER_PERMISSIONS_WORKSPACE_TOOLS_IMPORT=False \
-            -e USER_PERMISSIONS_WORKSPACE_SKILLS_ACCESS=False \
             -e ENABLE_WEB_SEARCH=False \
-            -e DEFAULT_MODEL_PARAMS='{"function_calling":"native"}' \
-            -e DEFAULT_MODEL_METADATA='{"capabilities":{"builtin_tools":false,"file_upload":true,"file_context":true,"web_search":false,"code_interpreter":false}}' \
+            -e ENABLE_PLUGINS=False \
             -v "$BASE/openwebui-data:/app/backend/data" \
             ghcr.io/open-webui/open-webui:main
 
-          READY=0
           for i in {1..180}; do
             if curl -fsS http://127.0.0.1:8080/ >/dev/null 2>&1; then
-              READY=1
-              break
+              echo "Open WebUI localhost:8080 READY"
+              exit 0
             fi
             sleep 2
           done
 
-          if [ "$READY" != "1" ]; then
-            echo "::error::Open WebUI gagal start."
-            docker logs --tail 250 open-webui || true
-            exit 1
+          docker logs --tail 250 open-webui || true
+          exit 1
+
+      - name: Install tunnel client
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ inputs.tunnel }}" = "ngrok-stable" ]; then
+            if [ -z "${NGROK_AUTHTOKEN:-}" ]; then
+              echo "::error::Secret NGROK_AUTHTOKEN belum dibuat."
+              exit 1
+            fi
+            python3 -m pip install --user --disable-pip-version-check "ngrok==1.7.0"
+          else
+            if [ -z "${CF_TUNNEL_TOKEN:-}" ]; then
+              echo "::error::Secret CF_TUNNEL_TOKEN belum dibuat."
+              exit 1
+            fi
+            if [ -z "${CF_PUBLIC_URL:-}" ]; then
+              echo "::error::Repository Variable CF_PUBLIC_URL belum dibuat (contoh https://ai.domainmu.com)."
+              exit 1
+            fi
+
+            curl --proto '=https' --tlsv1.2 -fL --retry 3 \
+              https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+              -o "$BASE/bin/cloudflared"
+            chmod 700 "$BASE/bin/cloudflared"
+            "$BASE/bin/cloudflared" --version
           fi
+
+      - name: Start ngrok for WebUI only
+        id: ngrok
+        if: ${{ inputs.tunnel == 'ngrok-stable' }}
+        shell: bash
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+        run: |
+          set -euo pipefail
+          exec python3 - <<'PY'
+          import ngrok, time, os
+          url_file = os.path.join(os.environ["BASE"], "public-url.txt")
+          listener = ngrok.forward(8080, authtoken_from_env=True)
+          with open(url_file, "w", encoding="utf-8") as f:
+              f.write(listener.url())
+          print("ngrok WebUI tunnel ready", flush=True)
+          while True:
+              time.sleep(3600)
+          PY
+        background: true
+
+      - name: Start Cloudflare named tunnel for WebUI only
+        id: cloudflare
+        if: ${{ inputs.tunnel == 'cloudflare-named' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec "$BASE/bin/cloudflared" tunnel \
+            --no-autoupdate \
+            run \
+            --token "$CF_TUNNEL_TOKEN"
+        background: true
+
+      - name: Publish WebUI URL
+        id: public
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ inputs.tunnel }}" = "ngrok-stable" ]; then
+            URL=""
+            for i in {1..90}; do
+              [ -s "$BASE/public-url.txt" ] && URL="$(cat "$BASE/public-url.txt")"
+              [ -n "$URL" ] && break
+              sleep 1
+            done
+            [ -n "$URL" ] || { echo "::error::ngrok URL tidak ditemukan."; exit 1; }
+
+            READY=0
+            for i in {1..90}; do
+              if curl -fsS --max-time 10 \
+                -H 'ngrok-skip-browser-warning: 1' \
+                "$URL/" >/dev/null 2>&1; then
+                READY=1
+                break
+              fi
+              sleep 2
+            done
+          else
+            URL="$CF_PUBLIC_URL"
+            READY=0
+            for i in {1..90}; do
+              if curl -fsS --max-time 10 "$URL/" >/dev/null 2>&1; then
+                READY=1
+                break
+              fi
+              sleep 2
+            done
+          fi
+
+          [ "$READY" = "1" ] || {
+            echo "::error::Public WebUI URL belum dapat dijangkau."
+            exit 1
+          }
+
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
 
           {
             echo
-            echo "## ✅ Open WebUI ready"
+            echo "## ✅ Local AI ready"
             echo
-            echo "URL yang sama: **$TUNNEL_URL**"
+            echo "WebUI: **$URL**"
             echo
             echo "Email: \`admin@local.ai\`"
             echo
             echo "Password: secret \`LOCAL_AI_PASSWORD\`"
             echo
-            echo "Model: \`$FINAL_MODEL\`"
+            echo "Model dipasang langsung di runner: \`${{ steps.model.outputs.name }}\`"
             echo
-            echo
-            echo "Builtin Tools sementara OFF agar model kecil/coder tidak lagi mengeluarkan tool-call acak seperti create_calendar_event."
+            echo "Ollama tetap private di \`127.0.0.1:11434\`; hanya Open WebUI port 8080 yang ditunnel."
           } >> "$GITHUB_STEP_SUMMARY"
 
           echo "========================================================"
-          echo " OPEN WEBUI READY"
-          echo " $TUNNEL_URL"
-          echo " Email: admin@local.ai"
-          echo " Password: LOCAL_AI_PASSWORD (secret, tidak dicetak)"
+          echo " LOCAL AI READY"
+          echo " $URL"
           echo "========================================================"
 
-      - name: Keep runner alive and health-check
+      - name: Keep runner alive
         shell: bash
         env:
-          TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
+          PUBLIC_URL: ${{ steps.public.outputs.url }}
         run: |
           set -euo pipefail
-
           echo "AI aktif. Stop workflow kalau sudah selesai."
 
           while true; do
-            if ! docker ps --format '{{.Names}}' | grep -qx 'open-webui'; then
-              echo "::error::Open WebUI container berhenti."
+            docker ps --format '{{.Names}}' | grep -qx open-webui || {
+              echo "::error::Open WebUI berhenti."
               docker logs --tail 250 open-webui || true
               exit 1
-            fi
+            }
 
-
-            if ! curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
-              echo "::error::Ollama tidak merespons."
+            curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1 || {
+              echo "::error::Ollama local berhenti."
               exit 1
-            fi
-
-            if ! curl -fsS --max-time 15               -H 'ngrok-skip-browser-warning: 1'               "$TUNNEL_URL/" >/dev/null 2>&1; then
-              echo "::warning::Public ngrok URL sementara tidak merespons; retry pada health-check berikutnya."
-            fi
+            }
 
             sleep 60
           done
-          
+
+      - wait-all:
+      
