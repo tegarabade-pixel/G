@@ -1,0 +1,390 @@
+name: Local AI Launcher
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  local-ai:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    env:
+      BASE: /home/runner/localai
+      SELECT_FILE: /home/runner/localai/selection.json
+      STATUS_FILE: /home/runner/localai/status.txt
+      OLLAMA_MODELS: /home/runner/localai/models
+      LOCAL_AI_PASSWORD: ${{ secrets.LOCAL_AI_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate secret
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${LOCAL_AI_PASSWORD:-}" ]; then
+            echo "::error::Repository secret LOCAL_AI_PASSWORD belum dibuat."
+            echo "::error::Buka Settings > Secrets and variables > Actions > New repository secret."
+            exit 1
+          fi
+
+      - name: Prepare workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p \
+            "$BASE/bin" \
+            "$BASE/models" \
+            "$BASE/openwebui-data" \
+            "$BASE/workspace/uploads" \
+            "$BASE/workspace/projects" \
+            "$BASE/workspace/outputs" \
+            "$BASE/custom" \
+            "$BASE/logs"
+
+          rm -f "$SELECT_FILE"
+          echo "Launcher sedang disiapkan..." > "$STATUS_FILE"
+
+          echo "Disk:"
+          df -h /
+          echo
+          echo "RAM:"
+          free -h
+
+      - name: Install Cloudflare Tunnel client
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o "$BASE/bin/cloudflared"
+          chmod +x "$BASE/bin/cloudflared"
+          "$BASE/bin/cloudflared" --version
+
+      - name: Start model selector
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Menunggu kamu memilih model..." > "$STATUS_FILE"
+
+          nohup python3 scripts/launcher.py \
+            --port 8080 \
+            --selection "$SELECT_FILE" \
+            --status "$STATUS_FILE" \
+            > "$BASE/logs/launcher.log" 2>&1 &
+
+          echo $! > "$BASE/launcher.pid"
+
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "Launcher gagal start:"
+          cat "$BASE/logs/launcher.log" || true
+          exit 1
+        env:
+          LAUNCH_PASSWORD: ${{ secrets.LOCAL_AI_PASSWORD }}
+
+      - name: Start public HTTPS tunnel
+        id: tunnel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          nohup "$BASE/bin/cloudflared" tunnel \
+            --no-autoupdate \
+            --url http://127.0.0.1:8080 \
+            > "$BASE/logs/cloudflared.log" 2>&1 &
+
+          echo $! > "$BASE/cloudflared.pid"
+
+          URL=""
+          for i in {1..60}; do
+            URL="$(grep -oE 'https://[-a-z0-9]+\.trycloudflare\.com' "$BASE/logs/cloudflared.log" | head -n1 || true)"
+            if [ -n "$URL" ]; then
+              break
+            fi
+            sleep 1
+          done
+
+          if [ -z "$URL" ]; then
+            echo "Tunnel gagal dibuat:"
+            cat "$BASE/logs/cloudflared.log" || true
+            exit 1
+          fi
+
+          printf '%s' "$URL" > "$BASE/tunnel.url"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+          echo
+          echo "========================================================"
+          echo " BUKA URL INI DARI HP:"
+          echo " $URL"
+          echo "========================================================"
+          echo "Password launcher = secret LOCAL_AI_PASSWORD milikmu."
+          echo "Password TIDAK dicetak karena repo kamu public."
+
+          {
+            echo "## 🚀 Local AI Launcher"
+            echo
+            echo "Buka: **$URL**"
+            echo
+            echo "Masukkan password yang kamu simpan sebagai repository secret \`LOCAL_AI_PASSWORD\`."
+            echo
+            echo "> URL ini terlihat di log public, tetapi launcher dan Open WebUI tetap membutuhkan password."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Wait for model selection
+        id: selection
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Workflow sedang menunggu pilihan model dari HP..."
+
+          for i in {1..1800}; do
+            if [ -s "$SELECT_FILE" ]; then
+              break
+            fi
+
+            if ! kill -0 "$(cat "$BASE/launcher.pid")" 2>/dev/null; then
+              echo "Launcher berhenti secara tak terduga."
+              cat "$BASE/logs/launcher.log" || true
+              exit 1
+            fi
+
+            if ! kill -0 "$(cat "$BASE/cloudflared.pid")" 2>/dev/null; then
+              echo "Cloudflare tunnel berhenti secara tak terduga."
+              cat "$BASE/logs/cloudflared.log" || true
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          if [ ! -s "$SELECT_FILE" ]; then
+            echo "Tidak ada model yang dipilih dalam 60 menit."
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import json, os
+          p = os.environ["SELECT_FILE"]
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(p, "r", encoding="utf-8") as f:
+              cfg = json.load(f)
+
+          with open(out, "a", encoding="utf-8") as f:
+              f.write(f"kind={cfg['kind']}\n")
+              f.write(f"model={cfg['model']}\n")
+              f.write(f"context={int(cfg['context'])}\n")
+
+          print("Pilihan diterima:")
+          print("  tipe   :", cfg["kind"])
+          print("  model  :", cfg["model"])
+          print("  context:", cfg["context"])
+          PY
+
+      - name: Install and start Ollama
+        shell: bash
+        env:
+          SELECTED_CONTEXT: ${{ steps.selection.outputs.context }}
+        run: |
+          set -euo pipefail
+          echo "Menginstall Ollama..." > "$STATUS_FILE"
+
+          curl -fsSL https://ollama.com/install.sh | sh
+
+          # Jika installer membuat service, hentikan supaya kita bisa memakai
+          # OLLAMA_MODELS dan context milik workflow ini.
+          sudo systemctl stop ollama 2>/dev/null || true
+          pkill -f "ollama serve" 2>/dev/null || true
+          sleep 2
+
+          echo "Menyalakan Ollama..." > "$STATUS_FILE"
+
+          nohup env \
+            OLLAMA_HOST=127.0.0.1:11434 \
+            OLLAMA_MODELS="$OLLAMA_MODELS" \
+            OLLAMA_CONTEXT_LENGTH="$SELECTED_CONTEXT" \
+            ollama serve \
+            > "$BASE/logs/ollama.log" 2>&1 &
+
+          echo $! > "$BASE/ollama.pid"
+
+          for i in {1..60}; do
+            if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+              ollama --version
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "Ollama gagal start:"
+          cat "$BASE/logs/ollama.log" || true
+          exit 1
+
+      - name: Download selected model
+        id: model
+        shell: bash
+        env:
+          MODEL_KIND: ${{ steps.selection.outputs.kind }}
+          MODEL_VALUE: ${{ steps.selection.outputs.model }}
+          SELECTED_CONTEXT: ${{ steps.selection.outputs.context }}
+        run: |
+          set -euo pipefail
+
+          if [ "$MODEL_KIND" = "ollama" ]; then
+            echo "Download model Ollama: $MODEL_VALUE" > "$STATUS_FILE"
+            ollama pull "$MODEL_VALUE"
+            FINAL_MODEL="$MODEL_VALUE"
+
+          elif [ "$MODEL_KIND" = "gguf" ]; then
+            echo "Download custom GGUF..." > "$STATUS_FILE"
+
+            GGUF="$BASE/custom/model.gguf"
+            curl -fL --retry 3 --retry-delay 3 "$MODEL_VALUE" -o "$GGUF"
+
+            cat > "$BASE/custom/Modelfile" <<EOF
+          FROM $GGUF
+          PARAMETER num_ctx $SELECTED_CONTEXT
+          EOF
+
+            echo "Import GGUF ke Ollama..." > "$STATUS_FILE"
+            ollama create custom-gguf -f "$BASE/custom/Modelfile"
+            FINAL_MODEL="custom-gguf"
+
+          else
+            echo "Tipe model tidak dikenal: $MODEL_KIND"
+            exit 1
+          fi
+
+          echo "Model siap: $FINAL_MODEL" > "$STATUS_FILE"
+          echo "name=$FINAL_MODEL" >> "$GITHUB_OUTPUT"
+
+          echo
+          ollama list
+
+      - name: Pull Open WebUI
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Download Open WebUI..." > "$STATUS_FILE"
+          docker pull ghcr.io/open-webui/open-webui:main
+
+      - name: Switch launcher to Open WebUI
+        shell: bash
+        env:
+          TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
+        run: |
+          set -euo pipefail
+
+          echo "Open WebUI sedang dinyalakan..." > "$STATUS_FILE"
+
+          # Simpan secret key hanya di runner ephemeral ini.
+          WEBUI_SECRET_KEY="$(openssl rand -hex 32)"
+
+          # Matikan selector. Cloudflare tetap hidup dan tetap menunjuk port 8080.
+          kill "$(cat "$BASE/launcher.pid")" 2>/dev/null || true
+
+          for i in {1..20}; do
+            if ! curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+
+          docker rm -f open-webui 2>/dev/null || true
+
+          docker run -d \
+            --name open-webui \
+            --network host \
+            -e OLLAMA_BASE_URL=http://127.0.0.1:11434 \
+            -e WEBUI_URL="$TUNNEL_URL" \
+            -e WEBUI_SECRET_KEY="$WEBUI_SECRET_KEY" \
+            -e WEBUI_ADMIN_EMAIL=admin@local.ai \
+            -e WEBUI_ADMIN_PASSWORD="$LOCAL_AI_PASSWORD" \
+            -e WEBUI_ADMIN_NAME="Local AI Admin" \
+            -e ENABLE_SIGNUP=False \
+            -e DEFAULT_USER_ROLE=pending \
+            -v "$BASE/openwebui-data:/app/backend/data" \
+            ghcr.io/open-webui/open-webui:main
+
+          echo "Menunggu Open WebUI..."
+
+          READY=0
+          for i in {1..180}; do
+            if curl -fsS http://127.0.0.1:8080/ >/dev/null 2>&1; then
+              READY=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$READY" != "1" ]; then
+            echo "Open WebUI gagal start."
+            docker logs --tail 200 open-webui || true
+            exit 1
+          fi
+
+          {
+            echo
+            echo "## ✅ Open WebUI siap"
+            echo
+            echo "URL: **$TUNNEL_URL**"
+            echo
+            echo
+            echo "Login:"
+            echo "- Email: \`admin@local.ai\`"
+            echo "- Password: repository secret \`LOCAL_AI_PASSWORD\` milikmu"
+            echo
+            echo "Model aktif tersedia: \`${{ steps.model.outputs.name }}\`"
+            echo
+            echo "> Jangan bagikan URL ini. Repo public membuat URL terlihat di Actions log."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo
+          echo "========================================================"
+          echo " OPEN WEBUI SIAP"
+          echo " $TUNNEL_URL"
+          echo " Email: admin@local.ai"
+          echo " Password: secret LOCAL_AI_PASSWORD (tidak dicetak)"
+          echo "========================================================"
+
+      - name: Keep runner alive
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Runner akan tetap hidup sampai job dihentikan atau timeout GitHub tercapai."
+
+          while true; do
+            if ! docker ps --format '{{.Names}}' | grep -qx 'open-webui'; then
+              echo "Open WebUI container berhenti."
+              docker logs --tail 200 open-webui || true
+              exit 1
+            fi
+
+            if ! kill -0 "$(cat "$BASE/cloudflared.pid")" 2>/dev/null; then
+              echo "Cloudflare tunnel berhenti."
+              cat "$BASE/logs/cloudflared.log" || true
+              exit 1
+            fi
+
+            if ! curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+              echo "Ollama tidak merespons."
+              cat "$BASE/logs/ollama.log" || true
+              exit 1
+            fi
+
+            sleep 60
+          done
+          
