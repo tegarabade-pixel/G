@@ -19,16 +19,12 @@ jobs:
       LOCAL_AI_PASSWORD: ${{ secrets.LOCAL_AI_PASSWORD }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Validate secret
         shell: bash
         run: |
           set -euo pipefail
           if [ -z "${LOCAL_AI_PASSWORD:-}" ]; then
-            echo "::error::Repository secret LOCAL_AI_PASSWORD belum dibuat."
-            echo "::error::Buka Settings > Secrets and variables > Actions > New repository secret."
+            echo "::error::Buat repository secret LOCAL_AI_PASSWORD dulu."
             exit 1
           fi
 
@@ -49,11 +45,200 @@ jobs:
           rm -f "$SELECT_FILE"
           echo "Launcher sedang disiapkan..." > "$STATUS_FILE"
 
-          echo "Disk:"
+          echo "===== DISK ====="
           df -h /
-          echo
-          echo "RAM:"
+          echo "===== RAM ====="
           free -h
+
+      - name: Create model selector
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > "$BASE/launcher.py" <<'PY'
+          import os, json, html, hmac, tempfile
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          from urllib.parse import parse_qs, urlparse
+
+          SELECT_FILE = os.environ["SELECT_FILE"]
+          STATUS_FILE = os.environ["STATUS_FILE"]
+          PASSWORD = os.environ["LOCAL_AI_PASSWORD"]
+
+          PRESETS = [
+              ("qwen3:8b", "Qwen 3 8B"),
+              ("qwen3:14b", "Qwen 3 14B"),
+              ("qwen2.5:14b", "Qwen 2.5 14B"),
+              ("qwen2.5-coder:7b", "Qwen 2.5 Coder 7B"),
+              ("qwen2.5-coder:14b", "Qwen 2.5 Coder 14B"),
+              ("custom_ollama", "Custom Ollama model"),
+              ("custom_gguf", "Custom GGUF URL / Abliterated"),
+          ]
+
+          CSS = """
+          body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b0d10;
+          color:#f4f6fb;font-family:system-ui,sans-serif;padding:18px}
+          .card{width:min(100%,560px);background:#151922;border:1px solid #2a3140;
+          border-radius:22px;padding:24px;box-sizing:border-box}
+          h1{margin-top:0}p{color:#a7afbd;line-height:1.5}
+          label{display:block;margin:16px 0 7px;font-weight:700}
+          select,input{width:100%;box-sizing:border-box;padding:14px;border-radius:13px;
+          border:1px solid #2a3140;background:#0f131a;color:#fff;font-size:16px}
+          button{width:100%;margin-top:20px;padding:15px;border:0;border-radius:14px;
+          font-size:16px;font-weight:800;background:#fff;color:#090a0c}
+          .note{margin-top:16px;padding:13px;border:1px solid #2a3140;border-radius:13px}
+          """
+
+          def status():
+              try:
+                  with open(STATUS_FILE, "r", encoding="utf-8") as f:
+                      return f.read().strip()
+              except:
+                  return "Sedang menyiapkan..."
+
+          def selected():
+              return os.path.exists(SELECT_FILE) and os.path.getsize(SELECT_FILE) > 0
+
+          def page(body, refresh=None):
+              meta = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
+              return f"""<!doctype html><html><head><meta charset="utf-8">
+              <meta name="viewport" content="width=device-width,initial-scale=1">{meta}
+              <style>{CSS}</style></head><body><div class="card">{body}</div></body></html>""".encode()
+
+          class H(BaseHTTPRequestHandler):
+              def sendb(self, b, code=200, ctype="text/html; charset=utf-8"):
+                  self.send_response(code)
+                  self.send_header("Content-Type", ctype)
+                  self.send_header("Cache-Control", "no-store")
+                  self.send_header("Content-Length", str(len(b)))
+                  self.end_headers()
+                  self.wfile.write(b)
+
+              def do_GET(self):
+                  if self.path == "/health":
+                      self.sendb(b"ok", 200, "text/plain")
+                      return
+
+                  if selected():
+                      self.sendb(page(
+                          f"<h1>Local AI sedang disiapkan</h1>"
+                          f"<p><b>{html.escape(status())}</b></p>"
+                          "<p>Halaman refresh otomatis. Setelah siap, URL yang sama menjadi Open WebUI.</p>",
+                          5
+                      ))
+                      return
+
+                  options = "".join(
+                      f'<option value="{html.escape(v)}">{html.escape(t)}</option>'
+                      for v,t in PRESETS
+                  )
+                  body = f"""
+                  <h1>Local AI Launcher</h1>
+                  <p>Pilih model setelah runner sudah hidup.</p>
+                  <form method="post" action="/select">
+                    <label>Password</label>
+                    <input type="password" name="password" required>
+
+                    <label>Model</label>
+                    <select name="preset" id="preset" onchange="chg()">{options}</select>
+
+                    <div id="customBox" style="display:none">
+                      <label id="customLabel">Custom model</label>
+                      <input id="custom" name="custom" type="text">
+                    </div>
+
+                    <label>Context</label>
+                    <select name="context">
+                      <option value="4096">4096 - hemat RAM</option>
+                      <option value="8192" selected>8192 - balanced</option>
+                      <option value="16384">16384 - berat</option>
+                    </select>
+
+                    <button type="submit">START AI</button>
+                  </form>
+
+                  <div class="note">
+                    Untuk Qwen Abliterated GGUF pilih <b>Custom GGUF URL</b> lalu tempel direct URL .gguf.
+                  </div>
+
+                  <script>
+                  function chg(){{
+                    let p=document.getElementById("preset").value;
+                    let c=(p==="custom_ollama"||p==="custom_gguf");
+                    document.getElementById("customBox").style.display=c?"block":"none";
+                    document.getElementById("custom").required=c;
+                    document.getElementById("customLabel").innerText=
+                      p==="custom_gguf"?"Direct GGUF URL":"Ollama model name";
+                  }}
+                  chg();
+                  </script>
+                  """
+                  self.sendb(page(body))
+
+              def do_POST(self):
+                  if self.path != "/select":
+                      self.send_error(404)
+                      return
+
+                  n = int(self.headers.get("Content-Length","0"))
+                  if n > 8192:
+                      self.send_error(413)
+                      return
+
+                  q = parse_qs(self.rfile.read(n).decode("utf-8","replace"))
+                  pw = q.get("password",[""])[0]
+
+                  if not hmac.compare_digest(pw, PASSWORD):
+                      self.sendb(page("<h1>Password salah</h1><p>Coba lagi.</p>"),403)
+                      return
+
+                  preset = q.get("preset",[""])[0]
+                  custom = q.get("custom",[""])[0].strip()
+                  ctx = q.get("context",["8192"])[0]
+                  if ctx not in {"4096","8192","16384"}:
+                      ctx="8192"
+
+                  if preset == "custom_ollama":
+                      if not custom:
+                          self.send_error(400)
+                          return
+                      kind, model = "ollama", custom
+                  elif preset == "custom_gguf":
+                      u=urlparse(custom)
+                      if u.scheme not in {"http","https"} or not u.netloc:
+                          self.send_error(400)
+                          return
+                      kind, model = "gguf", custom
+                  else:
+                      allowed={x[0] for x in PRESETS}
+                      if preset not in allowed or preset.startswith("custom_"):
+                          self.send_error(400)
+                          return
+                      kind, model = "ollama", preset
+
+                  data={"kind":kind,"model":model,"context":int(ctx)}
+
+                  fd,tmp=tempfile.mkstemp(dir=os.path.dirname(SELECT_FILE))
+                  with os.fdopen(fd,"w",encoding="utf-8") as f:
+                      json.dump(data,f)
+                  os.replace(tmp,SELECT_FILE)
+
+                  with open(STATUS_FILE,"w",encoding="utf-8") as f:
+                      f.write("Pilihan diterima. Workflow melanjutkan setup...")
+
+                  self.sendb(page(
+                      f"<h1>Pilihan diterima ✅</h1>"
+                      f"<p>{html.escape(model)}</p>"
+                      "<p>Tunggu. URL ini akan berubah menjadi Open WebUI.</p>",5
+                  ))
+
+              def log_message(self, fmt, *args):
+                  print(fmt % args, flush=True)
+
+          ThreadingHTTPServer(("127.0.0.1",8080), H).serve_forever()
+          PY
+
+          python3 -m py_compile "$BASE/launcher.py"
+          echo "launcher.py berhasil dibuat."
 
       - name: Install Cloudflare Tunnel client
         shell: bash
@@ -69,29 +254,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           echo "Menunggu kamu memilih model..." > "$STATUS_FILE"
 
-          nohup python3 scripts/launcher.py \
-            --port 8080 \
-            --selection "$SELECT_FILE" \
-            --status "$STATUS_FILE" \
+          nohup python3 "$BASE/launcher.py" \
             > "$BASE/logs/launcher.log" 2>&1 &
-
           echo $! > "$BASE/launcher.pid"
 
           for i in {1..30}; do
             if curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1; then
+              echo "Launcher OK"
               exit 0
             fi
             sleep 1
           done
 
-          echo "Launcher gagal start:"
           cat "$BASE/logs/launcher.log" || true
           exit 1
-        env:
-          LAUNCH_PASSWORD: ${{ secrets.LOCAL_AI_PASSWORD }}
 
       - name: Start public HTTPS tunnel
         id: tunnel
@@ -103,43 +281,34 @@ jobs:
             --no-autoupdate \
             --url http://127.0.0.1:8080 \
             > "$BASE/logs/cloudflared.log" 2>&1 &
-
           echo $! > "$BASE/cloudflared.pid"
 
           URL=""
           for i in {1..60}; do
             URL="$(grep -oE 'https://[-a-z0-9]+\.trycloudflare\.com' "$BASE/logs/cloudflared.log" | head -n1 || true)"
-            if [ -n "$URL" ]; then
-              break
-            fi
+            [ -n "$URL" ] && break
             sleep 1
           done
 
           if [ -z "$URL" ]; then
-            echo "Tunnel gagal dibuat:"
             cat "$BASE/logs/cloudflared.log" || true
             exit 1
           fi
 
-          printf '%s' "$URL" > "$BASE/tunnel.url"
           echo "url=$URL" >> "$GITHUB_OUTPUT"
 
           echo
           echo "========================================================"
-          echo " BUKA URL INI DARI HP:"
+          echo " BUKA DARI HP:"
           echo " $URL"
           echo "========================================================"
-          echo "Password launcher = secret LOCAL_AI_PASSWORD milikmu."
-          echo "Password TIDAK dicetak karena repo kamu public."
 
           {
             echo "## 🚀 Local AI Launcher"
             echo
             echo "Buka: **$URL**"
             echo
-            echo "Masukkan password yang kamu simpan sebagai repository secret \`LOCAL_AI_PASSWORD\`."
-            echo
-            echo "> URL ini terlihat di log public, tetapi launcher dan Open WebUI tetap membutuhkan password."
+            echo "Password: nilai secret \`LOCAL_AI_PASSWORD\` milikmu."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Wait for model selection
@@ -148,49 +317,22 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Workflow sedang menunggu pilihan model dari HP..."
-
           for i in {1..1800}; do
-            if [ -s "$SELECT_FILE" ]; then
-              break
-            fi
-
-            if ! kill -0 "$(cat "$BASE/launcher.pid")" 2>/dev/null; then
-              echo "Launcher berhenti secara tak terduga."
-              cat "$BASE/logs/launcher.log" || true
-              exit 1
-            fi
-
-            if ! kill -0 "$(cat "$BASE/cloudflared.pid")" 2>/dev/null; then
-              echo "Cloudflare tunnel berhenti secara tak terduga."
-              cat "$BASE/logs/cloudflared.log" || true
-              exit 1
-            fi
-
+            [ -s "$SELECT_FILE" ] && break
             sleep 2
           done
 
-          if [ ! -s "$SELECT_FILE" ]; then
-            echo "Tidak ada model yang dipilih dalam 60 menit."
-            exit 1
-          fi
+          [ -s "$SELECT_FILE" ] || { echo "Timeout menunggu pilihan."; exit 1; }
 
           python3 - <<'PY'
-          import json, os
-          p = os.environ["SELECT_FILE"]
-          out = os.environ["GITHUB_OUTPUT"]
-          with open(p, "r", encoding="utf-8") as f:
-              cfg = json.load(f)
-
-          with open(out, "a", encoding="utf-8") as f:
-              f.write(f"kind={cfg['kind']}\n")
-              f.write(f"model={cfg['model']}\n")
-              f.write(f"context={int(cfg['context'])}\n")
-
-          print("Pilihan diterima:")
-          print("  tipe   :", cfg["kind"])
-          print("  model  :", cfg["model"])
-          print("  context:", cfg["context"])
+          import os,json
+          with open(os.environ["SELECT_FILE"],encoding="utf-8") as f:
+              c=json.load(f)
+          with open(os.environ["GITHUB_OUTPUT"],"a",encoding="utf-8") as f:
+              f.write("kind="+c["kind"]+"\n")
+              f.write("model="+c["model"]+"\n")
+              f.write("context="+str(c["context"])+"\n")
+          print(c)
           PY
 
       - name: Install and start Ollama
@@ -200,35 +342,26 @@ jobs:
         run: |
           set -euo pipefail
           echo "Menginstall Ollama..." > "$STATUS_FILE"
-
           curl -fsSL https://ollama.com/install.sh | sh
 
-          # Jika installer membuat service, hentikan supaya kita bisa memakai
-          # OLLAMA_MODELS dan context milik workflow ini.
           sudo systemctl stop ollama 2>/dev/null || true
           pkill -f "ollama serve" 2>/dev/null || true
           sleep 2
 
           echo "Menyalakan Ollama..." > "$STATUS_FILE"
-
           nohup env \
             OLLAMA_HOST=127.0.0.1:11434 \
             OLLAMA_MODELS="$OLLAMA_MODELS" \
             OLLAMA_CONTEXT_LENGTH="$SELECTED_CONTEXT" \
             ollama serve \
             > "$BASE/logs/ollama.log" 2>&1 &
-
           echo $! > "$BASE/ollama.pid"
 
           for i in {1..60}; do
-            if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
-              ollama --version
-              exit 0
-            fi
+            curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && exit 0
             sleep 1
           done
 
-          echo "Ollama gagal start:"
           cat "$BASE/logs/ollama.log" || true
           exit 1
 
@@ -243,13 +376,11 @@ jobs:
           set -euo pipefail
 
           if [ "$MODEL_KIND" = "ollama" ]; then
-            echo "Download model Ollama: $MODEL_VALUE" > "$STATUS_FILE"
+            echo "Downloading $MODEL_VALUE ..." > "$STATUS_FILE"
             ollama pull "$MODEL_VALUE"
             FINAL_MODEL="$MODEL_VALUE"
-
-          elif [ "$MODEL_KIND" = "gguf" ]; then
-            echo "Download custom GGUF..." > "$STATUS_FILE"
-
+          else
+            echo "Downloading custom GGUF..." > "$STATUS_FILE"
             GGUF="$BASE/custom/model.gguf"
             curl -fL --retry 3 --retry-delay 3 "$MODEL_VALUE" -o "$GGUF"
 
@@ -258,26 +389,20 @@ jobs:
           PARAMETER num_ctx $SELECTED_CONTEXT
           EOF
 
-            echo "Import GGUF ke Ollama..." > "$STATUS_FILE"
+            echo "Importing GGUF..." > "$STATUS_FILE"
             ollama create custom-gguf -f "$BASE/custom/Modelfile"
             FINAL_MODEL="custom-gguf"
-
-          else
-            echo "Tipe model tidak dikenal: $MODEL_KIND"
-            exit 1
           fi
 
-          echo "Model siap: $FINAL_MODEL" > "$STATUS_FILE"
           echo "name=$FINAL_MODEL" >> "$GITHUB_OUTPUT"
-
-          echo
+          echo "Model siap: $FINAL_MODEL" > "$STATUS_FILE"
           ollama list
 
       - name: Pull Open WebUI
         shell: bash
         run: |
           set -euo pipefail
-          echo "Download Open WebUI..." > "$STATUS_FILE"
+          echo "Downloading Open WebUI..." > "$STATUS_FILE"
           docker pull ghcr.io/open-webui/open-webui:main
 
       - name: Switch launcher to Open WebUI
@@ -286,24 +411,14 @@ jobs:
           TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
         run: |
           set -euo pipefail
+          echo "Starting Open WebUI..." > "$STATUS_FILE"
 
-          echo "Open WebUI sedang dinyalakan..." > "$STATUS_FILE"
+          kill "$(cat "$BASE/launcher.pid")" 2>/dev/null || true
+          sleep 3
 
-          # Simpan secret key hanya di runner ephemeral ini.
           WEBUI_SECRET_KEY="$(openssl rand -hex 32)"
 
-          # Matikan selector. Cloudflare tetap hidup dan tetap menunjuk port 8080.
-          kill "$(cat "$BASE/launcher.pid")" 2>/dev/null || true
-
-          for i in {1..20}; do
-            if ! curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1; then
-              break
-            fi
-            sleep 1
-          done
-
           docker rm -f open-webui 2>/dev/null || true
-
           docker run -d \
             --name open-webui \
             --network host \
@@ -314,77 +429,47 @@ jobs:
             -e WEBUI_ADMIN_PASSWORD="$LOCAL_AI_PASSWORD" \
             -e WEBUI_ADMIN_NAME="Local AI Admin" \
             -e ENABLE_SIGNUP=False \
-            -e DEFAULT_USER_ROLE=pending \
             -v "$BASE/openwebui-data:/app/backend/data" \
             ghcr.io/open-webui/open-webui:main
 
-          echo "Menunggu Open WebUI..."
-
-          READY=0
           for i in {1..180}; do
             if curl -fsS http://127.0.0.1:8080/ >/dev/null 2>&1; then
-              READY=1
-              break
+              echo
+              echo "========================================================"
+              echo " OPEN WEBUI READY"
+              echo " $TUNNEL_URL"
+              echo " Email: admin@local.ai"
+              echo " Password: LOCAL_AI_PASSWORD"
+              echo "========================================================"
+
+              {
+                echo
+                echo "## ✅ Open WebUI ready"
+                echo
+                echo "URL: **$TUNNEL_URL**"
+                echo
+                echo "Email: \`admin@local.ai\`"
+                echo
+                echo "Password: secret \`LOCAL_AI_PASSWORD\`"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
             fi
             sleep 2
           done
 
-          if [ "$READY" != "1" ]; then
-            echo "Open WebUI gagal start."
-            docker logs --tail 200 open-webui || true
-            exit 1
-          fi
-
-          {
-            echo
-            echo "## ✅ Open WebUI siap"
-            echo
-            echo "URL: **$TUNNEL_URL**"
-            echo
-            echo
-            echo "Login:"
-            echo "- Email: \`admin@local.ai\`"
-            echo "- Password: repository secret \`LOCAL_AI_PASSWORD\` milikmu"
-            echo
-            echo "Model aktif tersedia: \`${{ steps.model.outputs.name }}\`"
-            echo
-            echo "> Jangan bagikan URL ini. Repo public membuat URL terlihat di Actions log."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          echo
-          echo "========================================================"
-          echo " OPEN WEBUI SIAP"
-          echo " $TUNNEL_URL"
-          echo " Email: admin@local.ai"
-          echo " Password: secret LOCAL_AI_PASSWORD (tidak dicetak)"
-          echo "========================================================"
+          docker logs --tail 200 open-webui || true
+          exit 1
 
       - name: Keep runner alive
         shell: bash
         run: |
           set -euo pipefail
-
-          echo "Runner akan tetap hidup sampai job dihentikan atau timeout GitHub tercapai."
+          echo "AI aktif. Stop workflow kalau sudah selesai."
 
           while true; do
-            if ! docker ps --format '{{.Names}}' | grep -qx 'open-webui'; then
-              echo "Open WebUI container berhenti."
-              docker logs --tail 200 open-webui || true
-              exit 1
-            fi
-
-            if ! kill -0 "$(cat "$BASE/cloudflared.pid")" 2>/dev/null; then
-              echo "Cloudflare tunnel berhenti."
-              cat "$BASE/logs/cloudflared.log" || true
-              exit 1
-            fi
-
-            if ! curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
-              echo "Ollama tidak merespons."
-              cat "$BASE/logs/ollama.log" || true
-              exit 1
-            fi
-
+            docker ps --format '{{.Names}}' | grep -qx open-webui || exit 1
+            kill -0 "$(cat "$BASE/cloudflared.pid")" 2>/dev/null || exit 1
+            curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1 || exit 1
             sleep 60
           done
           
