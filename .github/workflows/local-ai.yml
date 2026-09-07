@@ -1,4 +1,4 @@
-name: Local AI Launcher Hardened
+name: Local AI Launcher Hardened v1.3
 
 on:
   workflow_dispatch:
@@ -22,6 +22,7 @@ jobs:
       STATUS_FILE: /home/runner/localai/status.txt
       OLLAMA_MODELS: /home/runner/localai/models
       LOCAL_AI_PASSWORD: ${{ secrets.LOCAL_AI_PASSWORD }}
+      NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
 
     steps:
       - name: Harden runner and authorize owner
@@ -41,8 +42,15 @@ jobs:
             exit 1
           fi
 
+          if [ -z "${NGROK_AUTHTOKEN:-}" ]; then
+            echo "::error::Repository secret NGROK_AUTHTOKEN belum dibuat."
+            echo "::error::Secret ini diperlukan untuk URL ngrok yang tetap sama antar workflow run."
+            exit 1
+          fi
+
           # Tambahan masking; GitHub Secrets sendiri juga dimask.
           echo "::add-mask::$LOCAL_AI_PASSWORD"
+          echo "::add-mask::$NGROK_AUTHTOKEN"
 
           mkdir -p "$BASE"
           chmod 700 "$BASE"
@@ -187,7 +195,7 @@ jobs:
                       os.unlink(tmp)
 
           class H(BaseHTTPRequestHandler):
-              server_version = "LocalAILauncher/1.2"
+              server_version = "LocalAILauncher/1.3"
 
               def log_message(self, fmt, *args):
                   # Tidak log form body/password.
@@ -349,66 +357,114 @@ jobs:
           python3 -m py_compile "$BASE/launcher.py"
           echo "Secure launcher: OK"
 
-      - name: Install Cloudflare Tunnel client
+      - name: Install pinned ngrok SDK
         shell: bash
         run: |
           set -euo pipefail
           umask 077
 
-          curl --proto '=https' --tlsv1.2 -fL --retry 3 \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-            -o "$BASE/bin/cloudflared"
-
-          chmod 700 "$BASE/bin/cloudflared"
-          "$BASE/bin/cloudflared" --version
+          # Official ngrok Python SDK. Pinned supaya workflow public tidak
+          # otomatis mengambil versi baru tanpa kita review.
+          python3 -m pip install --user --disable-pip-version-check "ngrok==1.7.0"
+          python3 - <<'PY'
+          import ngrok
+          print("ngrok SDK import: OK")
+          PY
 
       - name: Start model selector
+        id: selector
         shell: bash
         run: |
           set -euo pipefail
           umask 077
-
           echo "Menunggu pilihan model..." > "$STATUS_FILE"
+          exec python3 "$BASE/launcher.py"
+        background: true
 
-          nohup python3 "$BASE/launcher.py" \
-            > "$BASE/logs/launcher.log" 2>&1 &
-          echo $! > "$BASE/launcher.pid"
-
-          for i in {1..30}; do
+      - name: Wait for local selector
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in {1..45}; do
             if curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1; then
-              echo "Launcher: OK"
+              echo "Launcher local: OK"
               exit 0
             fi
             sleep 1
           done
 
-          echo "::error::Launcher gagal start."
-          cat "$BASE/logs/launcher.log" || true
+          echo "::error::Launcher tidak merespons di localhost:8080."
           exit 1
 
-      - name: Start one HTTPS URL
-        id: tunnel
+      - name: Start stable ngrok URL
+        id: ngrok_tunnel
         shell: bash
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
         run: |
           set -euo pipefail
           umask 077
 
-          nohup "$BASE/bin/cloudflared" tunnel \
-            --no-autoupdate \
-            --url http://127.0.0.1:8080 \
-            > "$BASE/logs/cloudflared.log" 2>&1 &
-          echo $! > "$BASE/cloudflared.pid"
+          exec python3 - <<'PY'
+          import os
+          import time
+          import ngrok
+
+          base = os.environ["BASE"]
+          url_file = os.path.join(base, "public-url.txt")
+
+          # Pada ngrok Free, akun mendapat satu assigned development domain.
+          # Domain ini dipakai ulang pada run berikutnya, jadi URL tetap.
+          listener = ngrok.forward(8080, authtoken_from_env=True)
+          url = listener.url()
+
+          with open(url_file, "w", encoding="utf-8") as f:
+              f.write(url)
+
+          print("ngrok endpoint started", flush=True)
+
+          # Pertahankan listener selama GitHub job hidup.
+          while True:
+              time.sleep(3600)
+          PY
+        background: true
+
+      - name: Verify and publish one stable URL
+        id: tunnel
+        shell: bash
+        run: |
+          set -euo pipefail
 
           URL=""
-          for i in {1..60}; do
-            URL="$(grep -oE 'https://[-a-z0-9]+\.trycloudflare\.com' "$BASE/logs/cloudflared.log" | head -n1 || true)"
-            [ -n "$URL" ] && break
+          for i in {1..90}; do
+            if [ -s "$BASE/public-url.txt" ]; then
+              URL="$(cat "$BASE/public-url.txt")"
+              [ -n "$URL" ] && break
+            fi
             sleep 1
           done
 
           if [ -z "$URL" ]; then
-            echo "::error::Cloudflare tunnel gagal."
-            cat "$BASE/logs/cloudflared.log" || true
+            echo "::error::ngrok tidak menghasilkan URL."
+            exit 1
+          fi
+
+          # Jangan tampilkan URL sebelum benar-benar bisa dipakai dari Internet.
+          # Header ini melewati halaman peringatan ngrok pada health-check CLI.
+          READY=0
+          for i in {1..90}; do
+            BODY="$(curl -fsS --max-time 10 \
+              -H 'ngrok-skip-browser-warning: 1' \
+              "$URL/health" 2>/dev/null || true)"
+            if [ "$BODY" = "ok" ]; then
+              READY=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$READY" != "1" ]; then
+            echo "::error::URL ngrok dibuat tetapi belum dapat mencapai launcher."
             exit 1
           fi
 
@@ -419,9 +475,11 @@ jobs:
             echo
             echo "Buka dari HP: **$URL**"
             echo
-            echo "URL ini tetap sama dari selector sampai Open WebUI selama run ini aktif."
+            echo "URL ngrok Free assigned domain ini tetap sama pada run berikutnya selama memakai akun ngrok yang sama."
             echo
-            echo "Password selector/Open WebUI = repository secret \`LOCAL_AI_PASSWORD\`."
+            echo "Selector dan Open WebUI memakai URL yang sama."
+            echo
+            echo "Password = repository secret \`LOCAL_AI_PASSWORD\`."
           } >> "$GITHUB_STEP_SUMMARY"
 
           echo "========================================================"
@@ -432,6 +490,8 @@ jobs:
       - name: Wait for model selection
         id: selection
         shell: bash
+        env:
+          TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
         run: |
           set -euo pipefail
           umask 077
@@ -443,15 +503,14 @@ jobs:
               break
             fi
 
-            kill -0 "$(cat "$BASE/launcher.pid")" 2>/dev/null || {
-              echo "::error::Launcher berhenti."
+            if ! curl -fsS --max-time 5 http://127.0.0.1:8080/health >/dev/null 2>&1; then
+              echo "::error::Launcher local berhenti merespons."
               exit 1
-            }
+            fi
 
-            kill -0 "$(cat "$BASE/cloudflared.pid")" 2>/dev/null || {
-              echo "::error::Tunnel berhenti."
-              exit 1
-            }
+            if ! curl -fsS --max-time 10               -H 'ngrok-skip-browser-warning: 1'               "$TUNNEL_URL/health" >/dev/null 2>&1; then
+              echo "::warning::URL publik sedang tidak merespons; mencoba lagi..."
+            fi
 
             sleep 2
           done
@@ -481,10 +540,8 @@ jobs:
               print("model: custom GGUF")
           PY
 
-      - name: Install and tune Ollama
+      - name: Install Ollama
         shell: bash
-        env:
-          SELECTED_CONTEXT: ${{ steps.selection.outputs.context }}
         run: |
           set -euo pipefail
           umask 077
@@ -492,35 +549,48 @@ jobs:
           echo "Installing Ollama..." > "$STATUS_FILE"
           curl --proto '=https' --tlsv1.2 -fsSL https://ollama.com/install.sh | sh
 
+          # Matikan service bawaan installer; instance workflow kita sendiri
+          # akan dijalankan sebagai background step resmi GitHub Actions.
           sudo systemctl stop ollama 2>/dev/null || true
           pkill -f "ollama serve" 2>/dev/null || true
           sleep 2
+          ollama --version
 
-          echo "Starting Ollama (CPU optimized)..." > "$STATUS_FILE"
+      - name: Start tuned Ollama
+        id: ollama_server
+        shell: bash
+        env:
+          SELECTED_CONTEXT: ${{ steps.selection.outputs.context }}
+        run: |
+          set -euo pipefail
+          umask 077
 
-          nohup env \
-            OLLAMA_HOST=127.0.0.1:11434 \
-            OLLAMA_MODELS="$OLLAMA_MODELS" \
-            OLLAMA_CONTEXT_LENGTH="$SELECTED_CONTEXT" \
-            OLLAMA_NUM_PARALLEL=1 \
-            OLLAMA_MAX_LOADED_MODELS=1 \
-            OLLAMA_KEEP_ALIVE=15m \
-            ollama serve \
-            > "$BASE/logs/ollama.log" 2>&1 &
+          echo "Starting Ollama..." > "$STATUS_FILE"
 
-          echo $! > "$BASE/ollama.pid"
+          export OLLAMA_HOST=127.0.0.1:11434
+          export OLLAMA_MODELS="$OLLAMA_MODELS"
+          export OLLAMA_CONTEXT_LENGTH="$SELECTED_CONTEXT"
+          export OLLAMA_NUM_PARALLEL=1
+          export OLLAMA_MAX_LOADED_MODELS=1
+          export OLLAMA_KEEP_ALIVE=15m
 
-          for i in {1..60}; do
+          exec ollama serve
+        background: true
+
+      - name: Wait for Ollama
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for i in {1..75}; do
             if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
-              echo "Ollama: OK"
-              ollama --version
+              echo "Ollama API: OK"
               exit 0
             fi
             sleep 1
           done
 
-          echo "::error::Ollama gagal start."
-          cat "$BASE/logs/ollama.log" || true
+          echo "::error::Ollama tidak merespons di localhost:11434."
           exit 1
 
       - name: Download selected model
@@ -655,7 +725,10 @@ jobs:
           echo "Downloading Open WebUI..." > "$STATUS_FILE"
           docker pull ghcr.io/open-webui/open-webui:main
 
-      - name: Switch same URL to Open WebUI
+      - name: Stop model selector
+        cancel: selector
+
+      - name: Switch same stable URL to Open WebUI
         shell: bash
         env:
           TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
@@ -666,11 +739,9 @@ jobs:
 
           echo "Starting Open WebUI..." > "$STATUS_FILE"
 
-          # Hentikan selector tetapi JANGAN hentikan Cloudflare.
-          # Karena tunnel tetap menunjuk localhost:8080, URL tidak berubah.
-          kill "$(cat "$BASE/launcher.pid")" 2>/dev/null || true
-
-          for i in {1..20}; do
+          # Selector dihentikan oleh native GitHub background-step cancel.
+          # ngrok tetap hidup, jadi hostname publik tidak berubah.
+          for i in {1..30}; do
             if ! curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1; then
               break
             fi
@@ -745,6 +816,8 @@ jobs:
 
       - name: Keep runner alive and health-check
         shell: bash
+        env:
+          TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
         run: |
           set -euo pipefail
 
@@ -757,17 +830,16 @@ jobs:
               exit 1
             fi
 
-            if ! kill -0 "$(cat "$BASE/cloudflared.pid")" 2>/dev/null; then
-              echo "::error::Cloudflare tunnel berhenti."
-              cat "$BASE/logs/cloudflared.log" || true
-              exit 1
-            fi
 
             if ! curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
               echo "::error::Ollama tidak merespons."
-              cat "$BASE/logs/ollama.log" || true
               exit 1
+            fi
+
+            if ! curl -fsS --max-time 15               -H 'ngrok-skip-browser-warning: 1'               "$TUNNEL_URL/" >/dev/null 2>&1; then
+              echo "::warning::Public ngrok URL sementara tidak merespons; retry pada health-check berikutnya."
             fi
 
             sleep 60
           done
+          
